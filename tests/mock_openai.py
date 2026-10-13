@@ -16,7 +16,7 @@ class H(BaseHTTPRequestHandler):
         if calls == 1:
             self.send_response(429); self.send_header("retry-after", "3"); self.end_headers()
             self.wfile.write(b'{"error":"rate limited"}'); return
-        user = body["messages"][-1]["content"].split("Translate this passage:\n\n", 1)[1]
+        user = body["messages"][-1]["content"].split("<passage>\n", 1)[1].rsplit("\n</passage>", 1)[0]
         out = "\n\n".join(" ".join("অনুবাদ" for _ in p.split()) for p in user.split("\n\n"))
         resp = {"choices": [{"message": {"content": out}, "finish_reason": "stop"}],
                 "usage": {"prompt_tokens": len(user) // 4, "completion_tokens": len(out) // 3}}

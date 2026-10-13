@@ -35,6 +35,10 @@ class Checks(unittest.TestCase):
     def test_untranslated(self):
         self.assertTrue(ts.check(self.src, self.src, {}, "en", "bn"))
 
+    def test_extra_paragraphs_from_context(self):
+        out = "\n\n".join(["অ্যালিস দৌড়াল। খরগোশের দেরি হয়ে গেল।" * 2] * 6)
+        self.assertTrue(any("extra paragraphs" in p for p in ts.check(self.src * 2, out, {}, "en", "bn")))
+
     def test_glossary(self):
         out = "অ্যালিস দৌড়াল। " * 6 + "\n\nদেরি হয়ে গেল। " * 3
         gloss = {"Alice": "এলিস", "Rabbit": "খরগোশ", "late": "দেরি!", "ran": "ছুটল"}
@@ -60,6 +64,33 @@ class EndToEnd(unittest.TestCase):
             r = run("build", "-p", d)
             self.assertTrue(Path(d, "book_bn.epub").exists())
         srv.shutdown()
+
+
+class WebUI(unittest.TestCase):
+    def test_upload_and_status(self):
+        import json, time, urllib.request
+        sys.path.insert(0, str(ROOT))
+        import tomeshift_ui
+        with tempfile.TemporaryDirectory() as d:
+            srv = tomeshift_ui.ThreadingHTTPServer(("127.0.0.1", 0), tomeshift_ui.make_handler(
+                d, {c: v[0] for c, v in ts.LANGS.items()}, ts.BACKENDS))
+            threading.Thread(target=srv.serve_forever, daemon=True).start()
+            base = f"http://127.0.0.1:{srv.server_port}"
+            get = lambda path: json.loads(urllib.request.urlopen(base + path).read())
+            self.assertIn("bn", get("/api/meta")["langs"])
+            req = urllib.request.Request(base + "/api/prep?p=alice&from=en&lang=bn&words=150", method="POST",
+                                         data=(ROOT / "samples/alice.txt").read_bytes(), headers={"X-Filename": "alice.txt"})
+            urllib.request.urlopen(req)
+            for _ in range(60):
+                st = get("/api/status?p=alice")
+                if st["job"] and st["job"]["ok"] is not None:
+                    break
+                time.sleep(0.5)
+            self.assertTrue(st["job"]["ok"], st["job"])
+            self.assertEqual(st["chunks"], 3)
+            self.assertEqual(get("/api/projects")[0]["name"], "alice")
+            self.assertIn("Source term", urllib.request.urlopen(base + "/").read().decode())
+            srv.shutdown()
 
 
 if __name__ == "__main__":

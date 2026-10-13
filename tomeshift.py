@@ -13,6 +13,7 @@ or direct APIs (gemini-api, openai-api for any OpenAI-compatible server, anthrop
   tomeshift.py run -p PROJECT [-j 3] [--agents claude]     translate; pauses on limits, resumes itself
   tomeshift.py status -p PROJECT                           show % done
   tomeshift.py build -p PROJECT                            out/*.md -> book_<lang>.md + .epub
+  tomeshift.py ui                                           local web UI at http://127.0.0.1:8787
 
 Output files are the source of truth: kill it any time, run again, it continues.
 """
@@ -35,7 +36,7 @@ Rules:
 - Follow the glossary exactly when one is given. Transliterate other personal names consistently.
 - Keep the author's tone: dialogue should sound like real people talking; formal prose stays formal.
 - Keep numbers as they are written in the original.
-- Text marked as "previous passage" is context only. Never translate or repeat it.
+- Translate ONLY the text inside <passage>...</passage>. Text inside <context>...</context> comes just before it and is for continuity only: never translate, repeat or summarise it. Do not output the tags.
 - {style}
 """
 # code -> (name, regex for the target script or None, extra style rule)
@@ -380,6 +381,7 @@ LATIN = re.compile(r"[A-Za-z]")
 def tidy(out):
     out = re.sub(r"^```[a-z]*\n|\n```$", "", out.strip())
     out = re.sub(r"^(here is|here's|sure|translation)[^\n]*:\s*\n", "", out, flags=re.I)
+    out = re.sub(r"</?(passage|context)>", "", out).strip()
     return out.strip() + "\n"
 
 
@@ -405,6 +407,8 @@ def check(src, out, gloss, src_code, tgt_code):
     sp, op = src.count("\n\n"), out.count("\n\n")
     if op < sp * 0.75:
         problems.append(f"paragraphs merged/missing ({op + 1} vs {sp + 1})")
+    elif op > sp * 1.25 + 1:
+        problems.append(f"extra paragraphs ({op + 1} vs {sp + 1}): translate only the <passage>, not the <context>")
     missed = [f"{en} -> {tr}" for en, tr in gloss.items() if en in src and tr not in out]
     if len(missed) > 2:
         problems.append("glossary not followed: " + "; ".join(missed[:8]))
@@ -469,7 +473,7 @@ class Runner:
         if idx == 0:
             return ""
         prev = self.chunks[idx - 1].read_text().strip().split("\n\n")[-2:]
-        return "Previous passage (context only, do NOT translate):\n" + "\n\n".join(prev) + "\n\n"
+        return "<context>\n" + "\n\n".join(prev) + "\n</context>\n\n"
 
     def translate(self, idx):
         chunk = self.chunks[idx]
@@ -482,7 +486,7 @@ class Runner:
         feedback, backoff = "", 600
         for attempt in range(self.a.retries + 1):
             agent = self.pick_agent()
-            user = self.context_for(idx) + feedback + "Translate this passage:\n\n" + src
+            user = self.context_for(idx) + feedback + "<passage>\n" + src.strip() + "\n</passage>"
             try:
                 out = tidy(call_agent(agent, self.a.model if agent == self.agents[0] else None, system, user))
             except LimitHit as e:
@@ -613,8 +617,20 @@ def main():
             s.add_argument("--notify", help="command to send status messages, e.g. send-telegram")
         if name == "build":
             s.add_argument("--title")
+    s = sub.add_parser("ui", help="open the local web UI")
+    s.add_argument("--dir", default="tomeshift-projects", help="folder for books (default ./tomeshift-projects)")
+    s.add_argument("--host", default="127.0.0.1")
+    s.add_argument("--port", type=int, default=8787)
+    s.add_argument("--no-open", action="store_true", help="don't open a browser")
     a = ap.parse_args()
-    {"prep": cmd_prep, "glossary": cmd_glossary, "run": cmd_run, "status": cmd_status, "build": cmd_build}[a.cmd](a)
+    {"prep": cmd_prep, "glossary": cmd_glossary, "run": cmd_run, "status": cmd_status, "build": cmd_build,
+     "ui": cmd_ui}[a.cmd](a)
+
+
+def cmd_ui(a):
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import tomeshift_ui
+    tomeshift_ui.serve(a.dir, a.host, a.port, {c: v[0] for c, v in LANGS.items()}, BACKENDS, not a.no_open)
 
 
 if __name__ == "__main__":

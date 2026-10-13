@@ -1,18 +1,35 @@
-<p align="center"><img src="assets/banner.svg" alt="tomeshift: translate a whole book for under a dollar" width="100%"></p>
-
 <p align="center">
-<a href="LICENSE"><img alt="MIT license" src="https://img.shields.io/badge/license-MIT-0F766E"></a>
-<img alt="Python 3.10+" src="https://img.shields.io/badge/python-3.10%2B-13232E">
+  <img src="assets/logo.svg" alt="tomeshift logo" width="128">
 </p>
 
-# tomeshift
+<h1 align="center">tomeshift</h1>
 
-**Translate a whole book for under a dollar.** Any language to any language, with any LLM, or at no extra cost on the AI subscription you already have.
+<p align="center"><b>Translate a whole book for under a dollar.</b><br>
+Any language to any language. Any LLM, or $0 extra on the AI subscription you already have.</p>
 
-- **Use what you already pay for.** Run on Claude Code, Antigravity, OpenCode, Codex or Gemini CLI subscriptions at no extra cost, or on a pay-per-token API (Gemini, any OpenAI-compatible server, Anthropic).
+<p align="center">
+  <a href="LICENSE"><img alt="MIT license" src="https://img.shields.io/badge/license-MIT-0F766E"></a>
+  <img alt="Python 3.10+" src="https://img.shields.io/badge/python-3.10%2B-13232E">
+  <img alt="Agent skill" src="https://img.shields.io/badge/agent%20skill-Claude%20Code%20%7C%20Codex%20%7C%20Gemini%20%7C%20Cursor%20%7C%20OpenCode-F2A33A">
+</p>
+
+<p align="center">
+  <a href="#use-it-from-your-ai-coding-agent">Agent skill</a> ·
+  <a href="#use-the-web-ui">Web UI</a> ·
+  <a href="#use-the-cli">CLI</a> ·
+  <a href="#what-a-500-page-book-costs">Costs</a> ·
+  <a href="#backends">Backends</a>
+</p>
+
+<p align="center"><img src="assets/banner.svg" alt="tomeshift: translate a whole book for under a dollar" width="100%"></p>
+
+tomeshift turns a PDF, EPUB, TXT or Markdown book into a translated Markdown + EPUB.
+
+- **Use what you already pay for.** It drives Claude Code, Codex, Gemini CLI, OpenCode or Antigravity at no extra cost, or a pay-per-token API (Gemini, any OpenAI-compatible server, Anthropic).
 - **The LLM only translates.** Extraction, cleanup, chunking, checks and EPUB building are plain Python and cost nothing.
 - **Survives limits.** It shows live progress, pauses when a usage or rate limit hits, and continues on its own when the limit resets. You can kill it and re-run it at any time; finished chunks are never redone.
-- **One file, one dependency** (`pymupdf`, for PDFs).
+- **Consistent names.** A glossary you can edit keeps every character, place and term translated the same way across 500 pages.
+- **Small.** Two Python files, one dependency (`pymupdf`, for PDFs).
 
 ```
 ███████████░░░░░░░░░░░░░░  44.0%  66,120/150,300 words  PAUSED (limit) until 15:01  ETA 2:10:00
@@ -32,7 +49,57 @@ That's about 150,000 words: roughly 200k input tokens and 250k–400k output tok
 
 Estimates use published list prices at the time of writing plus ~10% for retries. Check your provider's current pricing. Pick the cheapest model whose 10-page sample you're happy with.
 
-## Quick start
+## Use it from your AI coding agent
+
+tomeshift ships as an agent skill. Once it's installed, just ask: *"Translate ~/Books/novel.epub into Bangla with tomeshift."* The agent prepares the book, shows you the glossary, runs the translation in the background, reports progress and builds the EPUB. It does **not** translate the book inside its own context, so your session stays fast and cheap.
+
+**Claude Code**
+
+```bash
+/plugin install tomeshift --marketplace Hasib105/tomeshift
+```
+
+or, from a terminal:
+
+```bash
+claude plugin marketplace add Hasib105/tomeshift
+claude plugin install tomeshift@tomeshift
+```
+
+**Codex, Cursor, OpenCode, Gemini CLI and other agents with skill support**
+
+```bash
+npx skills add Hasib105/tomeshift
+```
+
+**Gemini CLI extension**
+
+```bash
+gemini extensions install https://github.com/Hasib105/tomeshift
+```
+
+The skill lives at [`skills/tomeshift/SKILL.md`](skills/tomeshift/SKILL.md). You can also copy it into any agent's skills folder by hand.
+
+## Use the web UI
+
+```bash
+uvx --from git+https://github.com/Hasib105/tomeshift tomeshift ui
+```
+
+This opens http://127.0.0.1:8787. In the page you can:
+
+- drop in a book and pick the languages
+- choose a backend and model
+- edit the glossary
+- start or pause the translation and watch the progress bar
+- compare the original and the translation side by side, and redo any chunk with one click
+- download the EPUB
+
+It runs only on your machine, and books are stored in `./tomeshift-projects/`.
+
+<p align="center"><img src="assets/ui.png" alt="tomeshift web UI: progress, glossary editor, side-by-side preview" width="90%"></p>
+
+## Use the CLI
 
 ```bash
 # run without installing (needs uv: https://docs.astral.sh/uv/)
@@ -40,11 +107,13 @@ uvx --from git+https://github.com/Hasib105/tomeshift tomeshift --help
 
 # or install it
 pip install git+https://github.com/Hasib105/tomeshift
+```
 
+```bash
 tomeshift prep book.pdf -p mybook --from en --lang bn   # split + clean -> mybook/chunks/
-tomeshift glossary -p mybook                    # one call -> mybook/glossary.json (edit it!)
-tomeshift run -p mybook -j 3                    # translate (Claude Code by default)
-tomeshift build -p mybook --title "My Book"     # -> mybook/book_bn.md + book_bn.epub
+tomeshift glossary -p mybook                            # one call -> mybook/glossary.json (edit it!)
+tomeshift run -p mybook -j 3                            # translate (Claude Code by default)
+tomeshift build -p mybook --title "My Book"             # -> mybook/book_bn.md + book_bn.epub
 ```
 
 Running from a clone: `./tomeshift.py ...` (uv installs `pymupdf` automatically).
@@ -80,7 +149,7 @@ tomeshift run -p mybook --agents claude,agy --fallback   # use agy while Claude 
 2. **Only the needed glossary.** Names and terms are extracted once into `glossary.json`. Each chunk is sent only the entries it actually contains.
 3. **Tiny prompts for agents.** Claude Code's large default system prompt, tools, MCP servers and skills are switched off, and every agent runs in an empty directory so it doesn't load your `CLAUDE.md`/`AGENTS.md`.
 4. **No full second pass.** Every chunk is checked automatically: right script, little leftover English, sane length ratio, paragraphs intact, glossary followed. Only failing chunks are retried, with the reason included. Anything still failing is listed in `review.txt` for you.
-5. **Parallel-safe context.** Each chunk gets the previous chunk's last paragraphs (the source text) as context, so chunks can run in parallel without losing continuity.
+5. **Parallel-safe context.** Each chunk gets the previous chunk's last two source paragraphs inside a `<context>` tag, so chunks can run in parallel without losing continuity. If the model translates the context by mistake, the check catches it and the chunk is retried.
 
 A 500-page book is about 150k words, or roughly 60 chunks at the default size of 2,500 words.
 
