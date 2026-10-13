@@ -3,14 +3,21 @@
 Standard library only. Every action runs the normal CLI as a subprocess, so the UI and the CLI
 always behave the same, and a run started here keeps going exactly like `tomeshift run`.
 """
-import json, re, shutil, subprocess, sys, threading, webbrowser
+
+import json
+import re
+import shutil
+import subprocess
+import sys
+import threading
+import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 CLI = [sys.executable, str(Path(__file__).resolve().parent / "tomeshift.py")]
-RUNS = {}  # project name -> Popen of `tomeshift run`
-JOBS = {}  # project name -> {"step": ..., "ok": bool, "out": str} for prep/glossary/build
+RUNS: dict[str, subprocess.Popen] = {}  # project name -> Popen of `tomeshift run`
+JOBS: dict[str, dict] = {}  # project name -> {"step": ..., "ok": bool, "out": str} for prep/glossary/build
 
 
 def safe(name):
@@ -33,6 +40,7 @@ def make_handler(root, langs, backends):
         def go():
             r = subprocess.run(CLI + args, capture_output=True, text=True)
             JOBS[name] = {"step": args[0], "ok": r.returncode == 0, "out": (r.stdout + r.stderr).strip()[-1500:]}
+
         threading.Thread(target=go, daemon=True).start()
 
     class H(BaseHTTPRequestHandler):
@@ -40,7 +48,11 @@ def make_handler(root, langs, backends):
             pass
 
         def send(self, code, body, ctype="application/json"):
-            data = body if isinstance(body, bytes) else (json.dumps(body) if ctype == "application/json" else body).encode()
+            data = (
+                body
+                if isinstance(body, bytes)
+                else (json.dumps(body) if ctype == "application/json" else body).encode()
+            )
             self.send_response(code)
             self.send_header("Content-Type", ctype + ("; charset=utf-8" if "text" in ctype or "json" in ctype else ""))
             self.send_header("Content-Length", str(len(data)))
@@ -56,15 +68,28 @@ def make_handler(root, langs, backends):
                 if u.path == "/favicon.ico":
                     return self.send(200, ICON, "image/svg+xml")
                 if u.path == "/api/meta":
-                    return self.send(200, {"langs": langs, "backends": [b for b in backends if b in API_BACKENDS or shutil.which(CMD_OF.get(b, b))],
-                                           "all_backends": backends, "root": str(root)})
+                    return self.send(
+                        200,
+                        {
+                            "langs": langs,
+                            "backends": [b for b in backends if b in API_BACKENDS or shutil.which(CMD_OF.get(b, b))],
+                            "all_backends": backends,
+                            "root": str(root),
+                        },
+                    )
                 if u.path == "/api/projects":
                     out = []
                     for d in sorted(root.glob("*/manifest.json")):
                         m = json.loads(d.read_text())
                         pr = d.parent / "progress.json"
-                        out.append({"name": d.parent.name, **m, "progress": json.loads(pr.read_text()) if pr.exists() else None,
-                                    "running": d.parent.name in RUNS and RUNS[d.parent.name].poll() is None})
+                        out.append(
+                            {
+                                "name": d.parent.name,
+                                **m,
+                                "progress": json.loads(pr.read_text()) if pr.exists() else None,
+                                "running": d.parent.name in RUNS and RUNS[d.parent.name].poll() is None,
+                            }
+                        )
                     return self.send(200, out)
                 if u.path == "/api/status":
                     d = proj(q)
@@ -74,27 +99,49 @@ def make_handler(root, langs, backends):
                     chunks = sorted((d / "chunks").glob("*.md"))
                     done = sorted((d / "out").glob("*.md"))
                     files = [f.name for f in d.glob("book_*") if f.suffix in (".epub", ".md")]
-                    total = json.loads((d / "manifest.json").read_text())["words"] if (d / "manifest.json").exists() else 0
-                    return self.send(200, {
-                        "progress": json.loads(pr.read_text()) if pr.exists() else {"percent": 0, "status": "not started", "total_words": total},
-                        "running": d.name in RUNS and RUNS[d.name].poll() is None,
-                        "chunks": len(chunks), "done": len(done), "log": log, "review": review, "files": files,
-                        "job": JOBS.get(d.name), "last": done[-1].stem if done else None,
-                        "has_glossary": (d / "glossary.json").exists()})
+                    total = (
+                        json.loads((d / "manifest.json").read_text())["words"] if (d / "manifest.json").exists() else 0
+                    )
+                    return self.send(
+                        200,
+                        {
+                            "progress": json.loads(pr.read_text())
+                            if pr.exists()
+                            else {"percent": 0, "status": "not started", "total_words": total},
+                            "running": d.name in RUNS and RUNS[d.name].poll() is None,
+                            "chunks": len(chunks),
+                            "done": len(done),
+                            "log": log,
+                            "review": review,
+                            "files": files,
+                            "job": JOBS.get(d.name),
+                            "last": done[-1].stem if done else None,
+                            "has_glossary": (d / "glossary.json").exists(),
+                        },
+                    )
                 if u.path == "/api/glossary":
                     g = proj(q) / "glossary.json"
                     return self.send(200, json.loads(g.read_text()) if g.exists() else {})
                 if u.path == "/api/chunk":
                     d, n = proj(q), re.sub(r"\D", "", q.get("n", [""])[0])
                     src, out = d / "chunks" / f"{n}.md", d / "out" / f"{n}.md"
-                    return self.send(200, {"src": src.read_text() if src.exists() else "", "out": out.read_text() if out.exists() else ""})
+                    return self.send(
+                        200,
+                        {
+                            "src": src.read_text() if src.exists() else "",
+                            "out": out.read_text() if out.exists() else "",
+                        },
+                    )
                 if u.path == "/api/download":
                     d, f = proj(q), Path(q.get("f", [""])[0]).name
                     path = d / f
                     if not (f.startswith("book_") and path.exists()):
                         return self.send(404, {"error": "not built yet"})
                     self.send_response(200)
-                    self.send_header("Content-Type", "application/epub+zip" if f.endswith(".epub") else "text/markdown; charset=utf-8")
+                    self.send_header(
+                        "Content-Type",
+                        "application/epub+zip" if f.endswith(".epub") else "text/markdown; charset=utf-8",
+                    )
                     self.send_header("Content-Disposition", f'attachment; filename="{d.name}-{f}"')
                     data = path.read_bytes()
                     self.send_header("Content-Length", str(len(data)))
@@ -107,7 +154,10 @@ def make_handler(root, langs, backends):
         def do_POST(self):
             u = urlparse(self.path)
             q = parse_qs(u.query)
-            val = lambda k, dflt="": q.get(k, [dflt])[0]
+
+            def val(k, dflt=""):
+                return q.get(k, [dflt])[0]
+
             body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
             try:
                 d = proj(q)
@@ -119,8 +169,21 @@ def make_handler(root, langs, backends):
                     d.mkdir(parents=True, exist_ok=True)
                     src = d / ("source" + Path(fname).suffix.lower())
                     src.write_bytes(body)
-                    step(name, ["prep", str(src), "-p", str(d), "--from", val("from", "en"),
-                                "--lang", val("lang", "bn"), "--words", val("words", "2500")])
+                    step(
+                        name,
+                        [
+                            "prep",
+                            str(src),
+                            "-p",
+                            str(d),
+                            "--from",
+                            val("from", "en"),
+                            "--lang",
+                            val("lang", "bn"),
+                            "--words",
+                            val("words", "2500"),
+                        ],
+                    )
                     return self.send(200, {"ok": True})
                 if u.path == "/api/glossary":
                     if body:  # save edited glossary
@@ -135,12 +198,13 @@ def make_handler(root, langs, backends):
                 if u.path == "/api/run":
                     if name in RUNS and RUNS[name].poll() is None:
                         return self.send(200, {"ok": True, "already": True})
-                    args = CLI + ["run", "-p", str(d), "--agents", val("agents", "claude"), "-j", val("jobs", "3")]
+                    args = [*CLI, "run", "-p", str(d), "--agents", val("agents", "claude"), "-j", val("jobs", "3")]
                     if val("model"):
                         args += ["--model", val("model")]
                     if val("fallback") == "1":
                         args.append("--fallback")
-                    RUNS[name] = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=open(d / "ui-run.err", "w"))
+                    with open(d / "ui-run.err", "w") as err:  # the child keeps its own copy of the handle
+                        RUNS[name] = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=err)
                     return self.send(200, {"ok": True})
                 if u.path == "/api/stop":
                     if name in RUNS and RUNS[name].poll() is None:
@@ -160,10 +224,12 @@ def make_handler(root, langs, backends):
     return H
 
 
-ICON = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><rect width="512" height="512" rx="112" fill="#13232E"/>'
-        '<path d="M256 168C214 140 150 132 92 140V392C150 384 214 392 256 420Z" fill="#F7F4EC"/>'
-        '<path d="M256 168C298 140 362 132 420 140V392C362 384 298 392 256 420Z" fill="#E7F3F1"/>'
-        '<path d="M150 112C210 52 302 52 362 112" fill="none" stroke="#F2A33A" stroke-width="26" stroke-linecap="round"/></svg>')
+ICON = (
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><rect width="512" height="512" rx="112" fill="#13232E"/>'
+    '<path d="M256 168C214 140 150 132 92 140V392C150 384 214 392 256 420Z" fill="#F7F4EC"/>'
+    '<path d="M256 168C298 140 362 132 420 140V392C362 384 298 392 256 420Z" fill="#E7F3F1"/>'
+    '<path d="M150 112C210 52 302 52 362 112" fill="none" stroke="#F2A33A" stroke-width="26" stroke-linecap="round"/></svg>'
+)
 API_BACKENDS = {"gemini-api", "openai-api", "anthropic-api", "cmd"}
 CMD_OF = {"claude": "claude", "agy": "agy", "opencode": "opencode", "codex": "codex", "gemini": "gemini"}
 

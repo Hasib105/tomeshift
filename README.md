@@ -8,6 +8,9 @@
 Any language to any language. Any LLM, or $0 extra on the AI subscription you already have.</p>
 
 <p align="center">
+  <a href="https://github.com/Hasib105/tomeshift/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/Hasib105/tomeshift/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="https://github.com/Hasib105/tomeshift/actions/workflows/codeql.yml"><img alt="CodeQL" src="https://github.com/Hasib105/tomeshift/actions/workflows/codeql.yml/badge.svg"></a>
+  <a href="https://github.com/astral-sh/ruff"><img alt="Ruff" src="https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json"></a>
   <a href="LICENSE"><img alt="MIT license" src="https://img.shields.io/badge/license-MIT-0F766E"></a>
   <img alt="Python 3.10+" src="https://img.shields.io/badge/python-3.10%2B-13232E">
   <img alt="Agent skill" src="https://img.shields.io/badge/agent%20skill-Claude%20Code%20%7C%20Codex%20%7C%20Gemini%20%7C%20Cursor%20%7C%20OpenCode-F2A33A">
@@ -196,23 +199,21 @@ tomeshift prep upanyas.pdf -p upanyas --from bn --lang en
 ## Tests
 
 ```bash
-# fast suite: limit parsing, output checks, full run against a mock API (no keys needed)
-uv run --no-project --with pymupdf python tests/test_tomeshift.py -v
+uv run --no-project --with pymupdf --with pytest pytest      # 12 tests, ~7 s, no API keys needed
+uvx ruff check . && uvx ruff format --check . && uvx mypy tomeshift.py tomeshift_ui.py
+```
 
-# slow: limit -> pause -> auto-resume through the CLI path, with a fake agent (~3 minutes)
+CI runs these on Linux and macOS with Python 3.10–3.13. It also checks the plugin manifests and installs the built wheel. A slower manual test of the CLI pause/resume path uses a fake agent:
+
+```bash
 rm -f /tmp/tomeshift-fake-count
 ./tomeshift.py prep samples/alice.txt -p projects/t --words 150
-TOMESHIFT_CMD="$PWD/tests/fake_agent.sh" ./tomeshift.py run -p projects/t --agents cmd -j 1
-
-# API path with 429 handling, against a local mock
-python3 tests/mock_openai.py 8765 &
-./tomeshift.py prep samples/alice.txt -p projects/api --words 150
-OPENAI_BASE_URL=http://127.0.0.1:8765/v1 ./tomeshift.py run -p projects/api --agents openai-api
+TOMESHIFT_CMD="$PWD/tests/fake_agent.sh" ./tomeshift.py run -p projects/t --agents cmd -j 1   # ~3 min
 ```
 
 ## Contributing
 
-Issues and pull requests are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md). New backends, languages and limit-message patterns are the easiest places to start.
+Issues and pull requests are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md) and the [Code of Conduct](CODE_OF_CONDUCT.md). Report security problems privately (see [SECURITY.md](SECURITY.md)). New backends, languages and limit-message patterns are the easiest places to start.
 
 ## License
 
