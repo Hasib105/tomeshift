@@ -1,0 +1,36 @@
+name: Bug report
+description: Something went wrong while preparing, translating or building a book.
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What you ran, what you expected, and what you got instead.
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Command or UI steps
+      render: shell
+      placeholder: tomeshift run -p mybook --agents claude --model sonnet -j 3
+    validations:
+      required: true
+  - type: input
+    id: backend
+    attributes:
+      label: Backend and version
+      placeholder: "claude 2.1.x / codex 0.x / gemini-api gemini-2.5-flash-lite"
+    validations:
+      required: true
+  - type: input
+    id: env
+    attributes:
+      label: OS and Python version
+      placeholder: Ubuntu 24.04, Python 3.12
+  - type: textarea
+    id: log
+    attributes:
+      label: Relevant lines from run.log or the error output
+      render: text

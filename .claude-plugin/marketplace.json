@@ -1,0 +1,14 @@
+{
+  "name": "tomeshift",
+  "owner": { "name": "Hasib Ahmed", "url": "https://github.com/Hasib105" },
+  "description": "Book translation skill for coding agents.",
+  "plugins": [
+    {
+      "name": "tomeshift",
+      "source": "./",
+      "description": "Translate a whole book for under a dollar. Any language, any LLM: drives Claude Code, Codex, Gemini CLI, OpenCode, Antigravity or any API, pauses on usage limits and resumes automatically, outputs EPUB.",
+      "homepage": "https://github.com/Hasib105/tomeshift",
+      "license": "MIT"
+    }
+  ]
+}

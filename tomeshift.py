@@ -13,11 +13,25 @@ or direct APIs (gemini-api, openai-api for any OpenAI-compatible server, anthrop
   tomeshift.py run -p PROJECT [-j 3] [--agents claude]     translate; pauses on limits, resumes itself
   tomeshift.py status -p PROJECT                           show % done
   tomeshift.py build -p PROJECT                            out/*.md -> book_<lang>.md + .epub
+  tomeshift.py ui                                           local web UI at http://127.0.0.1:8787
 
 Output files are the source of truth: kill it any time, run again, it continues.
 """
-import argparse, html, json, os, re, shutil, subprocess, sys, tempfile, threading, time, zipfile
-import urllib.error, urllib.request
+
+import argparse
+import html
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.error
+import urllib.request
+import zipfile
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
@@ -35,7 +49,7 @@ Rules:
 - Follow the glossary exactly when one is given. Transliterate other personal names consistently.
 - Keep the author's tone: dialogue should sound like real people talking; formal prose stays formal.
 - Keep numbers as they are written in the original.
-- Text marked as "previous passage" is context only. Never translate or repeat it.
+- Translate ONLY the text inside <passage>...</passage>. Text inside <context>...</context> comes just before it and is for continuity only: never translate, repeat or summarise it. Do not output the tags.
 - {style}
 """
 # code -> (name, regex for the target script or None, extra style rule)
@@ -49,8 +63,12 @@ LANGS = {
     "ru": ("Russian", r"[\u0400-\u04FF]", ""),
     "zh": ("Simplified Chinese", r"[\u4E00-\u9FFF]", ""),
     "ja": ("Japanese", r"[\u3040-\u30FF\u4E00-\u9FFF]", ""),
-    "en": ("English", None, ""), "es": ("Spanish", None, ""), "fr": ("French", None, ""), "de": ("German", None, ""),
-    "pt": ("Portuguese", None, ""), "id": ("Indonesian", None, ""),
+    "en": ("English", None, ""),
+    "es": ("Spanish", None, ""),
+    "fr": ("French", None, ""),
+    "de": ("German", None, ""),
+    "pt": ("Portuguese", None, ""),
+    "id": ("Indonesian", None, ""),
 }
 
 
@@ -64,6 +82,8 @@ def rules_for(code, proj=None, source="en"):
     custom = Path(proj, "TRANSLATE.md") if proj else None
     text = custom.read_text() if custom and custom.exists() else RULES
     return text.replace("{language}", name).replace("{style}", style).replace("{source}", lang_info(source)[0])
+
+
 # Empty dir so agents don't load AGENTS.md / CLAUDE.md / project files (saves tokens).
 SANDBOX = Path(tempfile.gettempdir()) / "tomeshift-empty-cwd"
 SANDBOX.mkdir(exist_ok=True)
@@ -72,25 +92,56 @@ SANDBOX.mkdir(exist_ok=True)
 AGENTS = {
     # --system-prompt replaces Claude Code's large default prompt; no tools, no MCP, no skills.
     "claude": lambda model, system, user: (
-        ["claude", "-p", "--model", model or "sonnet", "--tools", "", "--strict-mcp-config",
-         "--setting-sources", "", "--disable-slash-commands", "--no-session-persistence",
-         "--effort", "low", "--system-prompt", system], user),
+        [
+            "claude",
+            "-p",
+            "--model",
+            model or "sonnet",
+            "--tools",
+            "",
+            "--strict-mcp-config",
+            "--setting-sources",
+            "",
+            "--disable-slash-commands",
+            "--no-session-persistence",
+            "--effort",
+            "low",
+            "--system-prompt",
+            system,
+        ],
+        user,
+    ),
     "agy": lambda model, system, user: (
-        ["agy", "-p", system + "\n\n" + user, "--model", model or "gemini-3.8-flash-low",
-         "--disable-slash-commands", "--print-timeout", "15m"], None),
+        [
+            "agy",
+            "-p",
+            system + "\n\n" + user,
+            "--model",
+            model or "gemini-3.8-flash-low",
+            "--disable-slash-commands",
+            "--print-timeout",
+            "15m",
+        ],
+        None,
+    ),
     "opencode": lambda model, system, user: (
-        ["opencode", "run", "--pure", "-m", model or "opencode/big-pickle", system + "\n\n" + user], None),
+        ["opencode", "run", "--pure", "-m", model or "opencode/big-pickle", system + "\n\n" + user],
+        None,
+    ),
     "codex": lambda model, system, user: (
-        ["codex", "exec", "--skip-git-repo-check"] + (["-m", model] if model else []) + ["-"], system + "\n\n" + user),
-    "gemini": lambda model, system, user: (
-        ["gemini"] + (["-m", model] if model else []) + ["-p", system], user),
+        ["codex", "exec", "--skip-git-repo-check"] + (["-m", model] if model else []) + ["-"],
+        system + "\n\n" + user,
+    ),
+    "gemini": lambda model, system, user: (["gemini"] + (["-m", model] if model else []) + ["-p", system], user),
     # Anything else: TOMESHIFT_CMD="llm -m gpt-4o-mini" gets the full prompt on stdin, prints the translation.
     "cmd": lambda model, system, user: (os.environ["TOMESHIFT_CMD"].split(), system + "\n\n" + user),
 }
 
 LIMIT_RE = re.compile(
     r"usage limit|rate.?limit|limit reached|hit your limit|quota|RESOURCE_EXHAUSTED|\b429\b|"
-    r"too many requests|overloaded|resets? (at|in)|try again (later|in)|credit balance", re.I)
+    r"too many requests|overloaded|resets? (at|in)|try again (later|in)|credit balance",
+    re.I,
+)
 
 
 def parse_reset(text):
@@ -118,7 +169,7 @@ class LimitHit(Exception):
 
 
 # ---------------------------------------------------------------- direct APIs (pay per token)
-USAGE = Counter()  # input/output tokens reported by APIs
+USAGE: Counter[str] = Counter()  # input/output tokens reported by APIs
 _usage_lock = threading.Lock()
 
 
@@ -133,10 +184,10 @@ def _post(url, body, headers, timeout):
             wait = e.headers.get("retry-after")
             m = re.search(r'"retryDelay":\s*"(\d+)s"', text)
             secs = int(m.group(1)) if m else int(wait) if wait and wait.isdigit() else None
-            raise LimitHit(datetime.now(timezone.utc) + timedelta(seconds=secs) if secs else parse_reset(text))
-        raise RuntimeError(f"HTTP {e.code}: {text[:300]}")
+            raise LimitHit(datetime.now(timezone.utc) + timedelta(seconds=secs) if secs else parse_reset(text)) from e
+        raise RuntimeError(f"HTTP {e.code}: {text[:300]}") from e
     except urllib.error.URLError as e:
-        raise RuntimeError(f"network: {e.reason}")
+        raise RuntimeError(f"network: {e.reason}") from e
 
 
 def _need(var):
@@ -147,29 +198,43 @@ def _need(var):
 
 def api_gemini(model, system, user, timeout):
     model = model or "gemini-2.5-flash"
-    r = _post(f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
-              {"systemInstruction": {"parts": [{"text": system}]},
-               "contents": [{"role": "user", "parts": [{"text": user}]}],
-               "generationConfig": {"temperature": 0.3, "maxOutputTokens": 32768,
-                                    "thinkingConfig": {"thinkingBudget": 0}}},
-              {"x-goog-api-key": _need("GEMINI_API_KEY")}, timeout)
+    r = _post(
+        f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+        {
+            "systemInstruction": {"parts": [{"text": system}]},
+            "contents": [{"role": "user", "parts": [{"text": user}]}],
+            "generationConfig": {"temperature": 0.3, "maxOutputTokens": 32768, "thinkingConfig": {"thinkingBudget": 0}},
+        },
+        {"x-goog-api-key": _need("GEMINI_API_KEY")},
+        timeout,
+    )
     u = r.get("usageMetadata", {})
     cand = (r.get("candidates") or [{}])[0]
     if cand.get("finishReason") == "MAX_TOKENS":
         raise RuntimeError("output cut off (MAX_TOKENS) - use smaller --words")
-    return "".join(p.get("text", "") for p in cand.get("content", {}).get("parts", [])), \
-        u.get("promptTokenCount", 0), u.get("candidatesTokenCount", 0)
+    return (
+        "".join(p.get("text", "") for p in cand.get("content", {}).get("parts", [])),
+        u.get("promptTokenCount", 0),
+        u.get("candidatesTokenCount", 0),
+    )
 
 
 def api_openai(model, system, user, timeout):
     # Any OpenAI-compatible server: OpenAI, OpenRouter, DeepSeek, Groq, Together, local Ollama/vLLM...
     base = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
-    key = os.environ.get("OPENAI_API_KEY", "none" if "localhost" in base or "127.0.0.1" in base else None) \
-        or _need("OPENAI_API_KEY")
-    r = _post(f"{base}/chat/completions",
-              {"model": model or "gpt-4o-mini", "temperature": 0.3,
-               "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]},
-              {"Authorization": f"Bearer {key}"}, timeout)
+    key = os.environ.get("OPENAI_API_KEY", "none" if "localhost" in base or "127.0.0.1" in base else None) or _need(
+        "OPENAI_API_KEY"
+    )
+    r = _post(
+        f"{base}/chat/completions",
+        {
+            "model": model or "gpt-4o-mini",
+            "temperature": 0.3,
+            "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+        },
+        {"Authorization": f"Bearer {key}"},
+        timeout,
+    )
     ch = r["choices"][0]
     if ch.get("finish_reason") == "length":
         raise RuntimeError("output cut off (length) - use smaller --words")
@@ -178,10 +243,18 @@ def api_openai(model, system, user, timeout):
 
 
 def api_anthropic(model, system, user, timeout):
-    r = _post("https://api.anthropic.com/v1/messages",
-              {"model": model or "claude-haiku-5-5", "max_tokens": 32000, "temperature": 0.3,
-               "system": system, "messages": [{"role": "user", "content": user}]},
-              {"x-api-key": _need("ANTHROPIC_API_KEY"), "anthropic-version": "2023-06-01"}, timeout)
+    r = _post(
+        "https://api.anthropic.com/v1/messages",
+        {
+            "model": model or "claude-haiku-5-5",
+            "max_tokens": 32000,
+            "temperature": 0.3,
+            "system": system,
+            "messages": [{"role": "user", "content": user}],
+        },
+        {"x-api-key": _need("ANTHROPIC_API_KEY"), "anthropic-version": "2023-06-01"},
+        timeout,
+    )
     if r.get("stop_reason") == "max_tokens":
         raise RuntimeError("output cut off (max_tokens) - use smaller --words")
     u = r.get("usage", {})
@@ -201,10 +274,18 @@ def call_agent(name, model, system, user, timeout=1200):
         return text.strip()
     cmd, stdin = AGENTS[name](model, system, user)
     try:
-        r = subprocess.run(cmd, input=stdin, capture_output=True, text=True, encoding="utf-8",
-                           errors="replace", timeout=timeout, cwd=SANDBOX)
+        r = subprocess.run(
+            cmd,
+            input=stdin,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+            cwd=SANDBOX,
+        )
     except subprocess.TimeoutExpired:
-        raise RuntimeError("timeout")
+        raise RuntimeError("timeout") from None
     out, err = r.stdout.strip(), r.stderr.strip()
     blob = out[-2000:] + "\n" + err[-2000:]
     # Only treat as a limit when the reply is short (a real translation may mention "quota").
@@ -217,7 +298,7 @@ def call_agent(name, model, system, user, timeout=1200):
 
 # ---------------------------------------------------------------- prep
 class _Text(HTMLParser):
-    BLOCK = {"p", "div", "h1", "h2", "h3", "h4", "h5", "h6", "li", "blockquote", "br", "tr"}
+    BLOCK = frozenset({"p", "div", "h1", "h2", "h3", "h4", "h5", "h6", "li", "blockquote", "br", "tr"})
 
     def __init__(self):
         super().__init__()
@@ -227,7 +308,9 @@ class _Text(HTMLParser):
         if tag in ("script", "style", "head"):
             self.skip += 1
         elif tag in self.BLOCK:
-            self.parts.append("\n\n" + ("# " if tag in ("h1", "h2") else "## " if tag[0] == "h" and tag[1:].isdigit() else ""))
+            self.parts.append(
+                "\n\n" + ("# " if tag in ("h1", "h2") else "## " if tag[0] == "h" and tag[1:].isdigit() else "")
+            )
         elif tag in ("i", "em"):
             self.parts.append("*")
 
@@ -262,12 +345,16 @@ def read_epub(path):
 
 def read_pdf(path):
     import fitz
+
     pages = []
     for page in fitz.open(path):
         blocks = [b[4] for b in page.get_text("blocks") if b[6] == 0]
         pages.append([re.sub(r"\s*\n\s*", "\n", b).strip() for b in blocks if b.strip()])
+
     # Headers/footers: short blocks that repeat (digits ignored) on many pages.
-    norm = lambda s: re.sub(r"\d+", "#", s.lower())
+    def norm(s):
+        return re.sub(r"\d+", "#", s.lower())
+
     freq = Counter(norm(b) for pg in pages for b in set(pg) if len(b) < 80)
     junk = {k for k, v in freq.items() if v >= max(3, len(pages) * 0.2)}
     if sum(len("".join(pg)) for pg in pages) < 200 * max(1, len(pages)) * 0.1:
@@ -293,8 +380,12 @@ def clean(text):
     # Re-join paragraphs split across PDF page/column breaks (no end punctuation, next starts lowercase).
     merged = []
     for p in paras:
-        if merged and not re.search(r'[.!?:;"”’)\]*]$', merged[-1]) and re.match(r"[a-z]", p) \
-                and not merged[-1].startswith("#"):
+        if (
+            merged
+            and not re.search(r'[.!?:;"”’)\]*]$', merged[-1])
+            and re.match(r"[a-z]", p)
+            and not merged[-1].startswith("#")
+        ):
             merged[-1] += " " + p
         else:
             merged.append(p)
@@ -329,9 +420,12 @@ def cmd_prep(a):
     for i, c in enumerate(chunks, 1):
         (proj / "chunks" / f"{i:04d}.md").write_text("\n\n".join(c) + "\n")
     total = sum(len(" ".join(c).split()) for c in chunks)
-    json.dump({"source": str(src.resolve()), "lang": a.lang, "from": getattr(a, "from"), "chunks": len(chunks), "words": total},
-              open(proj / "manifest.json", "w"), indent=1)
-    print(f"{len(chunks)} chunks, {total:,} words -> {proj}/chunks/  ({lang_info(getattr(a, "from"))[0]} -> {lang_info(a.lang)[0]})")
+    src_lang = getattr(a, "from")
+    manifest = {"source": str(src.resolve()), "lang": a.lang, "from": src_lang, "chunks": len(chunks), "words": total}
+    (proj / "manifest.json").write_text(json.dumps(manifest, indent=1))
+    print(
+        f"{len(chunks)} chunks, {total:,} words -> {proj}/chunks/  ({lang_info(src_lang)[0]} -> {lang_info(a.lang)[0]})"
+    )
 
 
 def project_lang(proj, key="lang"):
@@ -348,7 +442,9 @@ def cmd_glossary(a):
     # Scripts with capital letters: capitalised words/phrases not at sentence start, seen >= 3 times.
     # Other scripts (Bangla, Chinese, Arabic...): let the model pick the terms from a longer excerpt.
     cased = src_code in ("en", "es", "fr", "de", "pt", "id", "ru") or src_code not in LANGS
-    cands = Counter(m.group(1) for m in re.finditer(r"(?<![.!?]\s)(?<!^)\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3})\b", text, re.M))
+    cands = Counter(
+        m.group(1) for m in re.finditer(r"(?<![.!?]\s)(?<!^)\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3})\b", text, re.M)
+    )
     stop = {"I", "The", "A", "An", "He", "She", "It", "They", "We", "You", "But", "And", "Mr", "Mrs", "Then", "When"}
     terms = [t for t, n in cands.most_common(a.max_terms * 2) if n >= 3 and t not in stop][: a.max_terms]
     gfile = proj / "glossary.json"
@@ -358,14 +454,18 @@ def cmd_glossary(a):
         print("glossary.json already covers all candidates")
         return
     lang, src_name = lang_info(project_lang(proj))[0], lang_info(src_code)[0]
-    system = (f"You build translation glossaries for {src_name}->{lang} book translation. Reply with ONLY a JSON object "
-              f"mapping each {src_name} term to one fixed {lang} rendering (transliterate personal names; translate "
-              "titles and common nouns naturally). Drop entries that are not names/terms (ordinary words).")
+    system = (
+        f"You build translation glossaries for {src_name}->{lang} book translation. Reply with ONLY a JSON object "
+        f"mapping each {src_name} term to one fixed {lang} rendering (transliterate personal names; translate "
+        "titles and common nouns naturally). Drop entries that are not names/terms (ordinary words)."
+    )
     if todo is not None:
         user = f"Book excerpt for context:\n{text[:6000]}\n\nTerms:\n" + "\n".join(todo)
     else:
-        user = (f"List the names, places, titles and recurring special terms in this excerpt "
-                f"(up to {a.max_terms}).\n\n{text[:40000]}")
+        user = (
+            f"List the names, places, titles and recurring special terms in this excerpt "
+            f"(up to {a.max_terms}).\n\n{text[:40000]}"
+        )
     out = call_agent(a.agents.split(",")[0], a.model, system, user)
     m = re.search(r"\{.*\}", out, re.S)
     gloss.update(json.loads(m.group(0)) if m else {})
@@ -380,6 +480,7 @@ LATIN = re.compile(r"[A-Za-z]")
 def tidy(out):
     out = re.sub(r"^```[a-z]*\n|\n```$", "", out.strip())
     out = re.sub(r"^(here is|here's|sure|translation)[^\n]*:\s*\n", "", out, flags=re.I)
+    out = re.sub(r"</?(passage|context)>", "", out).strip()
     return out.strip() + "\n"
 
 
@@ -405,6 +506,8 @@ def check(src, out, gloss, src_code, tgt_code):
     sp, op = src.count("\n\n"), out.count("\n\n")
     if op < sp * 0.75:
         problems.append(f"paragraphs merged/missing ({op + 1} vs {sp + 1})")
+    elif op > sp * 1.25 + 1:
+        problems.append(f"extra paragraphs ({op + 1} vs {sp + 1}): translate only the <passage>, not the <context>")
     missed = [f"{en} -> {tr}" for en, tr in gloss.items() if en in src and tr not in out]
     if len(missed) > 2:
         problems.append("glossary not followed: " + "; ".join(missed[:8]))
@@ -416,9 +519,11 @@ class Runner:
     def __init__(self, a):
         self.a, self.proj = a, Path(a.project)
         self.agents = a.agents.split(",")
-        self.paused = {n: None for n in self.agents}  # agent -> UTC datetime it resumes
+        self.paused = dict.fromkeys(self.agents)  # agent -> UTC datetime it resumes
         self.lock = threading.Lock()
-        self.gloss = json.loads((self.proj / "glossary.json").read_text()) if (self.proj / "glossary.json").exists() else {}
+        self.gloss = (
+            json.loads((self.proj / "glossary.json").read_text()) if (self.proj / "glossary.json").exists() else {}
+        )
         self.chunks = sorted((self.proj / "chunks").glob("*.md"))
         self.words = {c.stem: len(c.read_text().split()) for c in self.chunks}
         self.total = sum(self.words.values())
@@ -444,11 +549,24 @@ class Runner:
         bar = "█" * int(pct / 4) + "░" * (25 - int(pct / 4))
         tok = f"  tokens {USAGE['in']:,} in / {USAGE['out']:,} out" if USAGE else ""
         line = f"{bar} {pct:5.1f}%  {done:,}/{self.total:,} words  {self.status}  {eta}{tok}"
-        print(("\r" + line.ljust(110)) if sys.stdout.isatty() else line, end="" if sys.stdout.isatty() else "\n", flush=True)
-        (self.proj / "progress.json").write_text(json.dumps(
-            {"percent": round(pct, 1), "done_words": done, "total_words": self.total, "status": self.status,
-             "tokens_in": USAGE["in"], "tokens_out": USAGE["out"],
-             "updated": datetime.now().isoformat(timespec="seconds")}))
+        print(
+            ("\r" + line.ljust(110)) if sys.stdout.isatty() else line,
+            end="" if sys.stdout.isatty() else "\n",
+            flush=True,
+        )
+        (self.proj / "progress.json").write_text(
+            json.dumps(
+                {
+                    "percent": round(pct, 1),
+                    "done_words": done,
+                    "total_words": self.total,
+                    "status": self.status,
+                    "tokens_in": USAGE["in"],
+                    "tokens_out": USAGE["out"],
+                    "updated": datetime.now().isoformat(timespec="seconds"),
+                }
+            )
+        )
 
     def pick_agent(self):
         """First non-paused agent. Without --fallback only the primary is ever used."""
@@ -469,7 +587,7 @@ class Runner:
         if idx == 0:
             return ""
         prev = self.chunks[idx - 1].read_text().strip().split("\n\n")[-2:]
-        return "Previous passage (context only, do NOT translate):\n" + "\n\n".join(prev) + "\n\n"
+        return "<context>\n" + "\n\n".join(prev) + "\n</context>\n\n"
 
     def translate(self, idx):
         chunk = self.chunks[idx]
@@ -478,11 +596,13 @@ class Runner:
             return
         src = chunk.read_text()
         terms = {k: v for k, v in self.gloss.items() if k in src}  # only terms this chunk uses
-        system = self.rules + ("\n\nGlossary (use exactly):\n" + "\n".join(f"{k} = {v}" for k, v in terms.items()) if terms else "")
+        system = self.rules + (
+            "\n\nGlossary (use exactly):\n" + "\n".join(f"{k} = {v}" for k, v in terms.items()) if terms else ""
+        )
         feedback, backoff = "", 600
         for attempt in range(self.a.retries + 1):
             agent = self.pick_agent()
-            user = self.context_for(idx) + feedback + "Translate this passage:\n\n" + src
+            user = self.context_for(idx) + feedback + "<passage>\n" + src.strip() + "\n</passage>"
             try:
                 out = tidy(call_agent(agent, self.a.model if agent == self.agents[0] else None, system, user))
             except LimitHit as e:
@@ -504,7 +624,8 @@ class Runner:
                 dest.write_text(out)
                 if problems:
                     self.log(chunk.stem, agent, "accepted with problems: " + " | ".join(problems))
-                    (self.proj / "review.txt").open("a").write(f"{chunk.stem}: {' | '.join(problems)}\n")
+                    with (self.proj / "review.txt").open("a") as f:
+                        f.write(f"{chunk.stem}: {' | '.join(problems)}\n")
                 return
             self.log(chunk.stem, agent, "retry: " + " | ".join(problems))
             feedback = "Your previous attempt had these problems, fix them: " + "; ".join(problems) + "\n\n"
@@ -520,14 +641,18 @@ class Runner:
         def ticker():
             while not stop.wait(2):
                 self.progress()
+
         threading.Thread(target=ticker, daemon=True).start()
         with ThreadPoolExecutor(self.a.jobs) as ex:
             list(ex.map(self.translate, todo))
         stop.set()
         self.status = "done"
         self.progress()
-        self.notify(f"finished: {self.done_words():,} words. Problems to review: "
-                    f"{len(open(self.proj / 'review.txt').readlines()) if (self.proj / 'review.txt').exists() else 0}")
+        review = self.proj / "review.txt"
+        self.notify(
+            f"finished: {self.done_words():,} words. Problems to review: "
+            f"{len(review.read_text().splitlines()) if review.exists() else 0}"
+        )
 
 
 def cmd_run(a):
@@ -570,15 +695,26 @@ def cmd_build(a):
         for p in paras:
             t = html.escape(p.strip())
             t = re.sub(r"\*(.+?)\*", r"<em>\1</em>", t)
-            body.append(f"<h1>{t[2:]}</h1>" if t.startswith("# ") else f"<h2>{t[3:]}</h2>" if t.startswith("## ") else f"<p>{t}</p>")
-        return (f'<?xml version="1.0" encoding="utf-8"?>\n<html xmlns="http://www.w3.org/1999/xhtml" lang="{lang}"><head>'
-                f'<title>-</title><style>body{{line-height:1.7}}</style></head><body>'
-                + "\n".join(body) + "</body></html>")
+            body.append(
+                f"<h1>{t[2:]}</h1>"
+                if t.startswith("# ")
+                else f"<h2>{t[3:]}</h2>"
+                if t.startswith("## ")
+                else f"<p>{t}</p>"
+            )
+        return (
+            f'<?xml version="1.0" encoding="utf-8"?>\n<html xmlns="http://www.w3.org/1999/xhtml" lang="{lang}"><head>'
+            f"<title>-</title><style>body{{line-height:1.7}}</style></head><body>" + "\n".join(body) + "</body></html>"
+        )
+
     title = a.title or proj.name
     epub = proj / f"book_{lang}.epub"
     with zipfile.ZipFile(epub, "w") as z:
         z.writestr("mimetype", "application/epub+zip", compress_type=zipfile.ZIP_STORED)
-        z.writestr("META-INF/container.xml", '<?xml version="1.0"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>')
+        z.writestr(
+            "META-INF/container.xml",
+            '<?xml version="1.0"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>',
+        )
         manifest, spine, nav = [], [], []
         for i, ch in enumerate(chapters, 1):
             z.writestr(f"OEBPS/c{i}.xhtml", to_html(ch), compress_type=zipfile.ZIP_DEFLATED)
@@ -586,23 +722,41 @@ def cmd_build(a):
             spine.append(f'<itemref idref="c{i}"/>')
             head = ch[0][2:] if ch[0].startswith("# ") else f"{i}"
             nav.append(f'<li><a href="c{i}.xhtml">{html.escape(head[:80])}</a></li>')
-        z.writestr("OEBPS/nav.xhtml", '<?xml version="1.0" encoding="utf-8"?><html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" lang="' + lang + '"><head><title>Contents</title></head><body><nav epub:type="toc"><ol>' + "".join(nav) + "</ol></nav></body></html>")
-        z.writestr("OEBPS/content.opf", f'<?xml version="1.0" encoding="utf-8"?><package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="id"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:identifier id="id">tomeshift-{html.escape(title)}</dc:identifier><dc:title>{html.escape(title)}</dc:title><dc:language>{lang}</dc:language><meta property="dcterms:modified">{datetime.now(timezone.utc):%Y-%m-%dT%H:%M:%SZ}</meta></metadata><manifest><item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>{"".join(manifest)}</manifest><spine>{"".join(spine)}</spine></package>')
-    print(f"{proj}/book_{lang}.md and book_{lang}.epub ({len(chapters)} chapters)" + (f"  WARNING: {missing} chunks not translated yet" if missing else ""))
+        z.writestr(
+            "OEBPS/nav.xhtml",
+            '<?xml version="1.0" encoding="utf-8"?><html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" lang="'
+            + lang
+            + '"><head><title>Contents</title></head><body><nav epub:type="toc"><ol>'
+            + "".join(nav)
+            + "</ol></nav></body></html>",
+        )
+        z.writestr(
+            "OEBPS/content.opf",
+            f'<?xml version="1.0" encoding="utf-8"?><package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="id"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:identifier id="id">tomeshift-{html.escape(title)}</dc:identifier><dc:title>{html.escape(title)}</dc:title><dc:language>{lang}</dc:language><meta property="dcterms:modified">{datetime.now(timezone.utc):%Y-%m-%dT%H:%M:%SZ}</meta></metadata><manifest><item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>{"".join(manifest)}</manifest><spine>{"".join(spine)}</spine></package>',
+        )
+    print(
+        f"{proj}/book_{lang}.md and book_{lang}.epub ({len(chapters)} chapters)"
+        + (f"  WARNING: {missing} chunks not translated yet" if missing else "")
+    )
 
 
 # ---------------------------------------------------------------- cli
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
-    s = sub.add_parser("prep"); s.add_argument("book"); s.add_argument("-p", "--project", required=True)
+    s = sub.add_parser("prep")
+    s.add_argument("book")
+    s.add_argument("-p", "--project", required=True)
     s.add_argument("--words", type=int, default=2500, help="target words per chunk (default 2500)")
     s.add_argument("--from", default="en", help="source language code (default en)")
     s.add_argument("--lang", default="bn", help=f"target language code (default bn). Built in: {', '.join(LANGS)}")
     for name in ("glossary", "run", "status", "build"):
-        s = sub.add_parser(name); s.add_argument("-p", "--project", required=True)
+        s = sub.add_parser(name)
+        s.add_argument("-p", "--project", required=True)
         if name in ("glossary", "run"):
-            s.add_argument("--agents", default="claude", help=f"comma list, first = main translator ({','.join(BACKENDS)})")
+            s.add_argument(
+                "--agents", default="claude", help=f"comma list, first = main translator ({','.join(BACKENDS)})"
+            )
             s.add_argument("--model", help="model for the main agent (e.g. sonnet, haiku, gemini-3.8-flash-low)")
         if name == "glossary":
             s.add_argument("--max-terms", type=int, default=250)
@@ -613,8 +767,27 @@ def main():
             s.add_argument("--notify", help="command to send status messages, e.g. send-telegram")
         if name == "build":
             s.add_argument("--title")
+    s = sub.add_parser("ui", help="open the local web UI")
+    s.add_argument("--dir", default="tomeshift-projects", help="folder for books (default ./tomeshift-projects)")
+    s.add_argument("--host", default="127.0.0.1")
+    s.add_argument("--port", type=int, default=8787)
+    s.add_argument("--no-open", action="store_true", help="don't open a browser")
     a = ap.parse_args()
-    {"prep": cmd_prep, "glossary": cmd_glossary, "run": cmd_run, "status": cmd_status, "build": cmd_build}[a.cmd](a)
+    {
+        "prep": cmd_prep,
+        "glossary": cmd_glossary,
+        "run": cmd_run,
+        "status": cmd_status,
+        "build": cmd_build,
+        "ui": cmd_ui,
+    }[a.cmd](a)
+
+
+def cmd_ui(a):
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import tomeshift_ui
+
+    tomeshift_ui.serve(a.dir, a.host, a.port, {c: v[0] for c, v in LANGS.items()}, BACKENDS, not a.no_open)
 
 
 if __name__ == "__main__":

@@ -7,4 +7,4 @@ if [ "$n" -le "${FAKE_LIMIT_CALLS:-2}" ]; then
   echo "You've hit your usage limit. Try again in 1m." >&2; exit 1
 fi
 # "Translate": one Bangla word per English word, paragraph breaks kept.
-printf '%s\n' "$input" | sed -n '/^Translate this passage:/,$p' | tail -n +3 | awk 'NF{s="";for(i=1;i<=NF;i++)s=s "অনুবাদ ";print s;next}{print}'
+printf '%s\n' "$input" | sed -n '/^<passage>$/,/^<\/passage>$/p' | sed '1d;$d' | awk 'NF{s="";for(i=1;i<=NF;i++)s=s "অনুবাদ ";print s;next}{print}'
