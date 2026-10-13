@@ -26,13 +26,16 @@ Any language to any language. Any LLM, or $0 extra on the AI subscription you al
 
 <p align="center"><img src="assets/banner.svg" alt="tomeshift: translate a whole book for under a dollar" width="100%"></p>
 
-tomeshift turns a PDF, EPUB, TXT or Markdown book into a translated Markdown + EPUB.
+tomeshift turns a **PDF, EPUB, DOCX, TXT or Markdown** book into a translated **EPUB, DOCX and Markdown**.
+
+- **EPUBs keep their original layout.** Only the text is swapped: images, CSS, fonts, footnotes, links, tables and code blocks stay exactly as they were. The title, description, table of contents and image alt text are translated too.
+- **Bilingual books.** `--layout bilingual` keeps each original paragraph followed by its translation, which is good for language learners.
 
 - **Use what you already pay for.** It drives Claude Code, Codex, Gemini CLI, OpenCode or Antigravity at no extra cost, or a pay-per-token API (Gemini, any OpenAI-compatible server, Anthropic).
 - **The LLM only translates.** Extraction, cleanup, chunking, checks and EPUB building are plain Python and cost nothing.
 - **Survives limits.** It shows live progress, pauses when a usage or rate limit hits, and continues on its own when the limit resets. You can kill it and re-run it at any time; finished chunks are never redone.
 - **Consistent names.** A glossary you can edit keeps every character, place and term translated the same way across 500 pages.
-- **Small.** Two Python files, one dependency (`pymupdf`, for PDFs).
+- **Small.** Three Python files, one dependency (`pymupdf`, for PDFs).
 
 ```
 ███████████░░░░░░░░░░░░░░  44.0%  66,120/150,300 words  PAUSED (limit) until 15:01  ETA 2:10:00
@@ -40,17 +43,17 @@ tomeshift turns a PDF, EPUB, TXT or Markdown book into a translated Markdown + E
 
 ## What a 500-page book costs
 
-That's about 150,000 words: roughly 200k input tokens and 250k–400k output tokens, depending on the target language.
+A 500-page book is about 150,000 words. That's roughly **200k input tokens** and **250k–400k output tokens**, depending on the target language. Models and prices change often, so here are price *tiers* rather than model names:
 
 | How you run it | Approx. cost |
 |---|---|
-| Claude Code / Codex / Gemini CLI / Antigravity subscription | **$0 extra** (uses your plan's quota) |
-| OpenCode free models, or a local model via Ollama | **$0** |
-| `gemini-api` with Gemini 2.5 Flash-Lite | **~$0.20** |
-| `openai-api` with GPT-4o-mini | **~$0.30** |
-| `gemini-api` with Gemini 2.5 Flash (higher quality) | ~$1 |
+| A coding-agent subscription you already have (Claude Code, Codex, Gemini CLI, Antigravity…) | **$0 extra**, uses your plan's quota |
+| Free hosted models (e.g. OpenCode's free tier) or a local model (Ollama, vLLM) | **$0** |
+| API, budget tier ("lite" / "mini" / "flash"-class models) | **~$0.10–0.30** |
+| API, mid tier (the provider's standard model) | **~$1–3** |
+| API, top tier (flagship models) | ~$5–30 |
 
-Estimates use published list prices at the time of writing plus ~10% for retries. Check your provider's current pricing. Pick the cheapest model whose 10-page sample you're happy with.
+**Work it out for any model:** cost ≈ input tokens × input price + output tokens × output price. Output is most of the bill, so compare models on their *output* price per million tokens. Add ~10% for retries. Translate a 10-page sample with two or three models and use the cheapest one you're happy with.
 
 ## Use it from your AI coding agent
 
@@ -116,7 +119,8 @@ pip install git+https://github.com/Hasib105/tomeshift
 tomeshift prep book.pdf -p mybook --from en --lang bn   # split + clean -> mybook/chunks/
 tomeshift glossary -p mybook                            # one call -> mybook/glossary.json (edit it!)
 tomeshift run -p mybook -j 3                            # translate (Claude Code by default)
-tomeshift build -p mybook --title "My Book"             # -> mybook/book_bn.md + book_bn.epub
+tomeshift build -p mybook                               # -> mybook/book_bn.epub + .docx + .md
+tomeshift build -p mybook --layout bilingual            # original + translation, paragraph by paragraph
 ```
 
 Running from a clone: `./tomeshift.py ...` (uv installs `pymupdf` automatically).
@@ -132,17 +136,17 @@ Pick one with `--agents`. The first one listed is the main translator.
 | `opencode` | `opencode run`; works with its free models | free / your plan |
 | `codex` | `codex exec -` | your ChatGPT plan |
 | `gemini` | Gemini CLI, `gemini -p` | free tier / plan |
-| `cmd` | any command that reads the prompt on stdin: `TOMESHIFT_CMD="llm -m gpt-4o-mini"` | depends |
+| `cmd` | any command that reads the prompt on stdin, e.g. `TOMESHIFT_CMD="llm -m MODEL"` | depends |
 | `gemini-api` | Gemini REST API (`GEMINI_API_KEY`) | per token |
 | `openai-api` | any OpenAI-compatible API (`OPENAI_API_KEY`, `OPENAI_BASE_URL`): OpenAI, OpenRouter, DeepSeek, Groq, local Ollama/vLLM | per token / free locally |
 | `anthropic-api` | Anthropic Messages API (`ANTHROPIC_API_KEY`) | per token |
 
-Choose a model with `--model` (for example `haiku`, `sonnet`, `gemini-3.8-flash-low`, `gemini-2.5-flash-lite`, `deepseek-chat`).
+Choose a model with `--model`, using whatever name that CLI or API accepts today. Run `claude --help`, `agy models`, `opencode models` or your provider's model list to see them. If you leave it out, each backend uses a sensible default.
 
 ```bash
-tomeshift run -p mybook --agents claude --model sonnet
-tomeshift run -p mybook --agents gemini-api --model gemini-2.5-flash-lite -j 8
-OPENAI_BASE_URL=https://openrouter.ai/api/v1 tomeshift run -p mybook --agents openai-api --model deepseek/deepseek-chat
+tomeshift run -p mybook --agents claude --model MODEL
+tomeshift run -p mybook --agents gemini-api --model MODEL -j 8            # cheapest "lite"/"flash" tier works well
+OPENAI_BASE_URL=https://openrouter.ai/api/v1 tomeshift run -p mybook --agents openai-api --model VENDOR/MODEL
 tomeshift run -p mybook --agents claude,agy --fallback   # use agy while Claude is limited
 ```
 
@@ -173,8 +177,20 @@ mybook/
   glossary.json        English -> target terms (edit before `run`)
   TRANSLATE.md         optional: your own instructions for this book
   manifest.json  progress.json  run.log  review.txt
-  book_bn.md  book_bn.epub
+  source.epub  segments.json   EPUB mode: the original book and where each segment lives
+  book_bn.epub  book_bn.docx  book_bn.md       (+ book_bn_bilingual.* with --layout bilingual)
 ```
+
+## Formats
+
+| Input | How it's handled |
+|---|---|
+| **EPUB** | Translated **in place**: each paragraph becomes a numbered segment, and inline formatting becomes markers (`⟦1⟧very⟦/1⟧`) that the model keeps. The original EPUB is rebuilt with only the text changed. Use `prep --flat` to rebuild from plain text instead. |
+| **DOCX** | Headings and italics are kept. Output is a new EPUB, DOCX and Markdown. |
+| **PDF** | Text PDFs. Running headers, footers and page numbers are removed. Scanned PDFs need OCR first (`ocrmypdf`). |
+| **TXT / Markdown** | Chapters are detected from headings. |
+
+If a model breaks the markers in a paragraph, the automatic check retries it. If it's still broken, that paragraph keeps the translated text but loses its inline formatting, and images and footnote links are never dropped. The build reports how many paragraphs that happened to.
 
 ## Languages
 
@@ -199,8 +215,8 @@ tomeshift prep upanyas.pdf -p upanyas --from bn --lang en
 ## Tests
 
 ```bash
-uv run --no-project --with pymupdf --with pytest pytest      # 12 tests, ~7 s, no API keys needed
-uvx ruff check . && uvx ruff format --check . && uvx mypy tomeshift.py tomeshift_ui.py
+uv run --no-project --with pymupdf --with pytest pytest      # 18 tests, ~7 s, no API keys needed
+uvx ruff check . && uvx ruff format --check . && uvx mypy tomeshift.py tomeshift_ui.py tomeshift_epub.py
 ```
 
 CI runs these on Linux and macOS with Python 3.10–3.13. It also checks the plugin manifests and installs the built wheel. A slower manual test of the CLI pause/resume path uses a fake agent:

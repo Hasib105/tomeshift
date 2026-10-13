@@ -12,6 +12,7 @@ from http.server import HTTPServer
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))  # tomeshift imports its sibling modules (tomeshift_epub, tomeshift_ui)
 sys.argv = ["tomeshift"]
 spec = importlib.util.spec_from_file_location("tomeshift", ROOT / "tomeshift.py")
 ts = importlib.util.module_from_spec(spec)
@@ -97,6 +98,126 @@ class TextPrep(unittest.TestCase):
             text = ts.read_epub(epub)  # our own reader can read what we wrote
             self.assertIn("Rabbit-Hole", text)
             self.assertIn("Pool of Tears", text)
+
+
+def fake_translate(project):
+    """Replace every English word with a Bangla word, keeping all markers (what a good model does)."""
+    import re
+
+    for c in Path(project, "chunks").glob("*.md"):
+        Path(project, "out", c.name).write_text(re.sub(r"[A-Za-z]+", "অনুবাদ", c.read_text()))
+
+
+class EpubInPlace(unittest.TestCase):
+    def setUp(self):
+        import argparse
+
+        sys.path.insert(0, str(ROOT / "tests"))
+        from epub_fixture import make_epub
+
+        self.tmp = tempfile.TemporaryDirectory()
+        self.d = Path(self.tmp.name)
+        make_epub(self.d / "alice.epub")
+        ts.cmd_prep(argparse.Namespace(book=str(self.d / "alice.epub"), project=str(self.d / "p"), words=400,
+                                       lang="bn", flat=False, **{"from": "en"}))  # fmt: skip
+        fake_translate(self.d / "p")
+        self.build = lambda layout: ts.cmd_build(
+            argparse.Namespace(project=str(self.d / "p"), title=None, layout=layout)
+        )
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def read(self, name, member):
+        import zipfile
+
+        with zipfile.ZipFile(self.d / "p" / name) as z:
+            return z.read(member)
+
+    def test_segments_and_markers(self):
+        chunk = (self.d / "p/chunks/0001.md").read_text()
+        self.assertIn("[[2]] Alice was beginning to get ⟦1⟧very⟦/1⟧ tired", chunk)
+        self.assertIn("The White Rabbit with a watch", chunk)  # img alt
+        self.assertIn("Loose words in a box.", chunk)  # text next to block elements
+        self.assertNotIn("do not translate me", chunk)  # <pre><code>
+        self.assertNotIn("⟦3⟧1⟦/3⟧", chunk)  # footnote number copied verbatim, not translated
+
+    def test_replace_layout_keeps_everything_else(self):
+        import xml.dom.minidom
+        import zipfile
+
+        self.build("replace")
+        src = self.d / "alice.epub"
+        with zipfile.ZipFile(self.d / "p/book_bn.epub") as z, zipfile.ZipFile(src) as orig:
+            first = z.infolist()[0]
+            self.assertEqual((first.filename, first.compress_type), ("mimetype", zipfile.ZIP_STORED))
+            for f in ("OEBPS/style.css", "OEBPS/images/rabbit.png"):
+                self.assertEqual(z.read(f), orig.read(f), f)
+            for n in z.namelist():
+                if n.endswith((".xhtml", ".opf", ".ncx")):
+                    xml.dom.minidom.parseString(z.read(n))  # still well-formed
+        ch = self.read("book_bn.epub", "OEBPS/text/ch1.xhtml").decode()
+        self.assertTrue(ch.startswith('<?xml version="1.0" encoding="utf-8"?>\n<!DOCTYPE html>'))
+        self.assertIn('lang="bn"', ch)
+        self.assertIn("<strong>অনুবাদ <em>অনুবাদ</em></strong>", ch)
+        self.assertIn('<a href="#n1" id="r1" epub:type="noteref"><sup>1</sup></a>', ch)
+        self.assertIn('print("do not translate me")', ch)
+        self.assertIn('alt="অনুবাদ', ch)
+        self.assertNotIn("Alice", ch)
+        opf = self.read("book_bn.epub", "OEBPS/content.opf").decode()
+        self.assertIn("<dc:language>bn</dc:language>", opf)
+        self.assertNotIn("Alice in Wonderland", opf)
+        self.assertNotIn("Rabbit-Hole", self.read("book_bn.epub", "OEBPS/toc.ncx").decode())
+        self.assertNotIn("Rabbit-Hole", self.read("book_bn.epub", "OEBPS/nav.xhtml").decode())
+
+    def test_bilingual_layout(self):
+        import re
+
+        self.build("bilingual")
+        ch = self.read("book_bn_bilingual.epub", "OEBPS/text/ch1.xhtml").decode()
+        self.assertIn("Alice was", ch)  # original kept
+        self.assertIn('<p class="first" lang="bn" xml:lang="bn">অনুবাদ', ch)  # translation right after it
+        ids = re.findall(r' id="([^"]+)"', ch)
+        self.assertEqual(len(ids), len(set(ids)), "duplicate ids")
+        md = (self.d / "p/book_bn_bilingual.md").read_text()
+        self.assertLess(md.index("Alice was"), md.index("অনুবাদ অনুবাদ অনুবাদ অনুবাদ অনুবাদ"))
+
+    def test_broken_markers_fall_back_safely(self):
+        out = self.d / "p/out/0001.md"
+        out.write_text(out.read_text().replace("⟦/1⟧", "", 1))  # model dropped a closing marker
+        self.build("replace")
+        ch = self.read("book_bn.epub", "OEBPS/text/ch1.xhtml").decode()
+        self.assertIn('<a href="#n1" id="r1"', ch)  # the footnote link survives the fallback
+        self.assertNotIn("⟦", ch)
+
+
+class Markers(unittest.TestCase):
+    def test_segment_and_inline_checks(self):
+        src = "[[1]] Hello ⟦1⟧world⟦/1⟧\n\n[[2]] Bye⟦2/⟧"
+        self.assertEqual(ts.check_markers(src, "[[1]] হ্যালো ⟦1⟧বিশ্ব⟦/1⟧\n\n[[2]] বিদায়⟦2/⟧"), [])
+        # dropping a whole formatting pair is fine (no word to emphasise in the target language)...
+        self.assertEqual(ts.check_markers(src, "[[1]] হ্যালো বিশ্ব\n\n[[2]] বিদায়⟦2/⟧"), [])
+        # ...but losing an image/note marker, half a pair, or duplicating one is not
+        self.assertTrue(ts.check_markers(src, "[[1]] হ্যালো ⟦1⟧বিশ্ব⟦/1⟧\n\n[[2]] বিদায়"))
+        self.assertTrue(ts.check_markers(src, "[[1]] হ্যালো ⟦1⟧বিশ্ব\n\n[[2]] বিদায়⟦2/⟧"))
+        self.assertTrue(ts.check_markers(src, "[[1]] ⟦1⟧হ্যালো⟦/1⟧ ⟦1⟧বিশ্ব⟦/1⟧\n\n[[2]] বিদায়⟦2/⟧"))
+        self.assertTrue(ts.check_markers(src, "[[1]] হ্যালো ⟦1⟧বিশ্ব⟦/1⟧ বিদায়⟦2/⟧"))  # segment 2 merged
+
+
+class Docx(unittest.TestCase):
+    def test_roundtrip(self):
+        md = "# Chapter One\n\nAlice was *very* tired.\n\n## Part\n\nঅ্যালিস খুব ক্লান্ত।\n"
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d, "b.docx")
+            ts.write_docx(md, path, "bn", "Alice")
+            self.assertEqual(ts.read_docx(path), md.strip())
+            try:
+                import docx  # python-docx, if installed, must open it too (= Word-compatible structure)
+            except ImportError:
+                return
+            doc = docx.Document(str(path))
+            self.assertEqual(doc.paragraphs[0].style.name, "Heading 1")
+            self.assertTrue(doc.paragraphs[1].runs[1].italic)
 
 
 class EndToEnd(unittest.TestCase):

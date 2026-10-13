@@ -12,7 +12,7 @@ or direct APIs (gemini-api, openai-api for any OpenAI-compatible server, anthrop
   tomeshift.py glossary -p PROJECT                         one agent call -> glossary.json (edit it!)
   tomeshift.py run -p PROJECT [-j 3] [--agents claude]     translate; pauses on limits, resumes itself
   tomeshift.py status -p PROJECT                           show % done
-  tomeshift.py build -p PROJECT                            out/*.md -> book_<lang>.md + .epub
+  tomeshift.py build -p PROJECT [--layout bilingual]       -> book_<lang>.epub (original layout kept) + .md + .docx
   tomeshift.py ui                                           local web UI at http://127.0.0.1:8787
 
 Output files are the source of truth: kill it any time, run again, it continues.
@@ -46,6 +46,7 @@ Rules:
 - Translate everything. Do not summarise, skip, shorten, or add content.
 - Keep the same paragraphs, in the same order, separated by one blank line.
 - Keep markdown as-is: lines starting with "# " stay headings, *text* stays italic.
+- Keep every marker exactly: a paragraph starting with [[12]] must start with [[12]] in your output, and inline markers like ⟦1⟧…⟦/1⟧ (formatting) and ⟦2/⟧ (images, note links) must wrap / sit at the matching translated words. Never drop, renumber or invent markers.
 - Follow the glossary exactly when one is given. Transliterate other personal names consistently.
 - Keep the author's tone: dialogue should sound like real people talking; formal prose stays formal.
 - Keep numbers as they are written in the original.
@@ -398,19 +399,46 @@ HEADING_RE = re.compile(r"^(#|(chapter|part|book|prologue|epilogue)\b|[IVXLC]+\.
 def cmd_prep(a):
     src = Path(a.book)
     proj = Path(a.project)
+    proj.mkdir(parents=True, exist_ok=True)
     ext = src.suffix.lower()
-    text = read_pdf(src) if ext == ".pdf" else read_epub(src) if ext == ".epub" else src.read_text()
-    paras = clean(text)
+    mode = "text"
+    if ext == ".epub" and not getattr(a, "flat", False):
+        # In-place: keep the original EPUB and translate its text segments; layout, images and CSS stay untouched.
+        import tomeshift_epub
+
+        mode = "epub"
+        segs = tomeshift_epub.extract(src)
+        if src.resolve() != (proj / "source.epub").resolve():
+            shutil.copyfile(src, proj / "source.epub")
+        (proj / "segments.json").write_text(
+            # keep the original text only for OPF/NCX entries: build() swaps those strings in place
+            json.dumps(
+                [{k: v for k, v in sg.items() if k != "text" or sg["kind"] == "xml"} for sg in segs], ensure_ascii=False
+            )
+        )
+        items = [(f"[[{sg['id']}]] {sg['text']}", sg["head"]) for sg in segs]
+    else:
+        text = (
+            read_pdf(src)
+            if ext == ".pdf"
+            else read_epub(src)
+            if ext == ".epub"
+            else read_docx(src)
+            if ext == ".docx"
+            else src.read_text()
+        )
+        items = []
+        for p in clean(text):
+            is_head = bool(len(p) < 80 and HEADING_RE.match(p))
+            items.append(("# " + p if is_head and not p.startswith("#") else p, is_head))
     chunks, cur, words = [], [], 0
-    for p in paras:
-        is_head = len(p) < 80 and HEADING_RE.match(p)
-        if cur and (words + len(p.split()) > a.words or (is_head and words > a.words * 0.3)):
+    for p, is_head in items:
+        n = len(MARKERS.sub(" ", p).split())
+        if cur and (words + n > a.words or (is_head and words > a.words * 0.3)):
             chunks.append(cur)
             cur, words = [], 0
-        if is_head and not p.startswith("#"):
-            p = "# " + p
         cur.append(p)
-        words += len(p.split())
+        words += n
     if cur:
         chunks.append(cur)
     (proj / "chunks").mkdir(parents=True, exist_ok=True)
@@ -419,12 +447,14 @@ def cmd_prep(a):
         old.unlink()
     for i, c in enumerate(chunks, 1):
         (proj / "chunks" / f"{i:04d}.md").write_text("\n\n".join(c) + "\n")
-    total = sum(len(" ".join(c).split()) for c in chunks)
+    total = sum(len(MARKERS.sub(" ", " ".join(c)).split()) for c in chunks)
     src_lang = getattr(a, "from")
-    manifest = {"source": str(src.resolve()), "lang": a.lang, "from": src_lang, "chunks": len(chunks), "words": total}
+    manifest = {"source": str(src.resolve()), "lang": a.lang, "from": src_lang, "chunks": len(chunks), "words": total,
+                "mode": mode}  # fmt: skip
     (proj / "manifest.json").write_text(json.dumps(manifest, indent=1))
     print(
         f"{len(chunks)} chunks, {total:,} words -> {proj}/chunks/  ({lang_info(src_lang)[0]} -> {lang_info(a.lang)[0]})"
+        + ("  [EPUB kept in place]" if mode == "epub" else "")
     )
 
 
@@ -437,7 +467,7 @@ def project_lang(proj, key="lang"):
 # ---------------------------------------------------------------- glossary
 def cmd_glossary(a):
     proj = Path(a.project)
-    text = "\n".join(p.read_text() for p in sorted((proj / "chunks").glob("*.md")))
+    text = MARKERS.sub("", "\n".join(p.read_text() for p in sorted((proj / "chunks").glob("*.md"))))
     src_code = project_lang(proj, "from")
     # Scripts with capital letters: capitalised words/phrases not at sentence start, seen >= 3 times.
     # Other scripts (Bangla, Chinese, Arabic...): let the model pick the terms from a longer excerpt.
@@ -487,10 +517,39 @@ def tidy(out):
 DENSE = {"zh", "ja"}  # scripts where character counts aren't comparable to alphabetic text
 
 
+MARKERS = re.compile(r"\[\[\d+\]\]|⟦/?\d+/?⟧")
+SEG = re.compile(r"^\[\[(\d+)\]\][ \t]*", re.M)
+
+
+def split_segments(text):
+    """'[[3]] a\n\n[[4]] b' -> {3: 'a', 4: 'b'}"""
+    parts = SEG.split(text)
+    return {int(parts[i]): parts[i + 1].strip() for i in range(1, len(parts) - 1, 2)}
+
+
+def check_markers(src, out):
+    """EPUB mode: every [[id]] once, and the same inline ⟦n⟧ markers inside each segment."""
+    s, o = split_segments(src), split_segments(out)
+    if not s:
+        return []
+    problems = []
+    missing, extra = sorted(set(s) - set(o)), sorted(set(o) - set(s))
+    if missing or extra:
+        problems.append(f"segment markers changed (missing {missing[:6]}, unexpected {extra[:6]}): keep every [[n]]")
+    import tomeshift_epub
+
+    bad = [(i, issue) for i in s if i in o and (issue := tomeshift_epub.marker_issue(s[i], o[i]))]
+    if bad:
+        detail = "; ".join(f"[[{i}]] {issue}" for i, issue in bad[:5])
+        problems.append(f"inline markers broken ({detail}): keep ⟦n/⟧ markers and keep pairs whole")
+    return problems
+
+
 def check(src, out, gloss, src_code, tgt_code):
     problems = []
     if not out.strip():
         return ["output is empty"]
+    problems += check_markers(src, out)
     tgt_script = lang_info(tgt_code)[1] or LATIN
     src_script = lang_info(src_code)[1] or LATIN
     if tgt_script.pattern != src_script.pattern:  # different scripts: we can tell languages apart
@@ -525,7 +584,7 @@ class Runner:
             json.loads((self.proj / "glossary.json").read_text()) if (self.proj / "glossary.json").exists() else {}
         )
         self.chunks = sorted((self.proj / "chunks").glob("*.md"))
-        self.words = {c.stem: len(c.read_text().split()) for c in self.chunks}
+        self.words = {c.stem: len(MARKERS.sub(" ", c.read_text()).split()) for c in self.chunks}
         self.total = sum(self.words.values())
         self.t0, self.done0 = time.time(), self.done_words()
         self.status = "running"
@@ -587,7 +646,7 @@ class Runner:
         if idx == 0:
             return ""
         prev = self.chunks[idx - 1].read_text().strip().split("\n\n")[-2:]
-        return "<context>\n" + "\n\n".join(prev) + "\n</context>\n\n"
+        return "<context>\n" + MARKERS.sub("", "\n\n".join(prev)).strip() + "\n</context>\n\n"
 
     def translate(self, idx):
         chunk = self.chunks[idx]
@@ -674,14 +733,88 @@ def cmd_status(a):
 
 
 # ---------------------------------------------------------------- build
+def book_paragraphs(proj):
+    """[(source, translation or None, is_heading)] in reading order, as plain text (markers removed)."""
+    man = json.loads((proj / "manifest.json").read_text())
+    rows = []
+    if man.get("mode") == "epub":
+        import tomeshift_epub
+
+        segs = json.loads((proj / "segments.json").read_text())
+        src, out = {}, {}
+        for c in sorted((proj / "chunks").glob("*.md")):
+            src.update(split_segments(c.read_text()))
+            o = proj / "out" / c.name
+            if o.exists():
+                out.update(split_segments(o.read_text()))
+        for sg in segs:
+            if sg["kind"] == "xhtml":
+                tr = out.get(sg["id"])
+                rows.append((tomeshift_epub.plain(src.get(sg["id"], "")), tr and tomeshift_epub.plain(tr), sg["head"]))
+        return rows
+    for c in sorted((proj / "chunks").glob("*.md")):
+        sp = [p.strip() for p in c.read_text().split("\n\n") if p.strip()]
+        o = proj / "out" / c.name
+        op = [p.strip() for p in o.read_text().split("\n\n") if p.strip()] if o.exists() else []
+        if len(sp) == len(op):
+            rows += [(a, b, a.startswith("# ")) for a, b in zip(sp, op, strict=True)]
+        else:  # can't pair paragraph by paragraph: keep the chunk together
+            rows += [(a, None, a.startswith("# ")) for a in sp] if not op else []
+            rows += [("", b, b.startswith("# ")) for b in op]
+    return rows
+
+
+def render_markdown(rows, layout):
+    out = []
+    for src, tr, head in rows:
+        if tr is None:
+            continue
+        if layout == "bilingual" and src:
+            if head:
+                out += [tr if tr.startswith("#") else "# " + tr, "*" + src.lstrip("# ") + "*"]
+            else:
+                out += [src, tr]
+        else:
+            out.append(tr if not head or tr.startswith("#") else "# " + tr)
+    return "\n\n".join(out) + "\n"
+
+
 def cmd_build(a):
     proj = Path(a.project)
-    outs = sorted((proj / "out").glob("*.md"))
-    missing = len(list((proj / "chunks").glob("*.md"))) - len(outs)
-    md = "\n\n".join(o.read_text().strip() for o in outs) + "\n"
-    lang = project_lang(proj)
-    (proj / f"book_{lang}.md").write_text(md)
-    # Minimal EPUB 3 (no pandoc needed): split chapters at "# " headings.
+    man = json.loads((proj / "manifest.json").read_text())
+    lang, layout = man.get("lang", "bn"), getattr(a, "layout", "replace")
+    suffix = "" if layout == "replace" else "_bilingual"
+    missing = len(list((proj / "chunks").glob("*.md"))) - len(list((proj / "out").glob("*.md")))
+    rows = book_paragraphs(proj)
+    md = render_markdown(rows, layout)
+    (proj / f"book_{lang}{suffix}.md").write_text(md)
+    title = a.title or proj.name
+    write_docx(md, proj / f"book_{lang}{suffix}.docx", lang, title)
+    epub = proj / f"book_{lang}{suffix}.epub"
+    if man.get("mode") == "epub":
+        import tomeshift_epub
+
+        segs = json.loads((proj / "segments.json").read_text())
+        translations = {}
+        for o in sorted((proj / "out").glob("*.md")):
+            translations.update(split_segments(o.read_text()))
+        st = tomeshift_epub.build(proj / "source.epub", segs, translations, epub, lang, layout)
+        detail = f"original layout kept; {st['translated']} segments translated"
+        if st["fallback"]:
+            detail += f", {st['fallback']} with formatting simplified"
+        if st["missing"]:
+            detail += f", {st['missing']} not translated yet"
+    else:
+        write_simple_epub(md, epub, lang, title)
+        detail = "rebuilt from text"
+    print(
+        f"{proj}/book_{lang}{suffix}.md, .docx and .epub ({detail})"
+        + (f"  WARNING: {missing} chunks not translated yet" if missing else "")
+    )
+
+
+def write_simple_epub(md, epub, lang, title):
+    """Minimal EPUB 3 for plain-text sources (no pandoc needed): chapters split at "# " headings."""
     chapters, cur = [], []
     for para in md.split("\n\n"):
         if para.startswith("# ") and cur:
@@ -689,6 +822,7 @@ def cmd_build(a):
             cur = []
         cur.append(para)
     chapters.append(cur)
+    rtl = ' dir="rtl"' if lang.split("-")[0] in ("ar", "ur", "fa", "he") else ""
 
     def to_html(paras):
         body = []
@@ -703,12 +837,12 @@ def cmd_build(a):
                 else f"<p>{t}</p>"
             )
         return (
-            f'<?xml version="1.0" encoding="utf-8"?>\n<html xmlns="http://www.w3.org/1999/xhtml" lang="{lang}"><head>'
-            f"<title>-</title><style>body{{line-height:1.7}}</style></head><body>" + "\n".join(body) + "</body></html>"
+            f'<?xml version="1.0" encoding="utf-8"?>\n<html xmlns="http://www.w3.org/1999/xhtml" lang="{lang}"'
+            f' xml:lang="{lang}"{rtl}><head><title>-</title><style>body{{line-height:1.7}}</style></head><body>'
+            + "\n".join(body)
+            + "</body></html>"
         )
 
-    title = a.title or proj.name
-    epub = proj / f"book_{lang}.epub"
     with zipfile.ZipFile(epub, "w") as z:
         z.writestr("mimetype", "application/epub+zip", compress_type=zipfile.ZIP_STORED)
         z.writestr(
@@ -734,10 +868,117 @@ def cmd_build(a):
             "OEBPS/content.opf",
             f'<?xml version="1.0" encoding="utf-8"?><package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="id"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:identifier id="id">tomeshift-{html.escape(title)}</dc:identifier><dc:title>{html.escape(title)}</dc:title><dc:language>{lang}</dc:language><meta property="dcterms:modified">{datetime.now(timezone.utc):%Y-%m-%dT%H:%M:%SZ}</meta></metadata><manifest><item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>{"".join(manifest)}</manifest><spine>{"".join(spine)}</spine></package>',
         )
-    print(
-        f"{proj}/book_{lang}.md and book_{lang}.epub ({len(chapters)} chapters)"
-        + (f"  WARNING: {missing} chunks not translated yet" if missing else "")
+
+
+# ---------------------------------------------------------------- DOCX (stdlib only)
+W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+
+
+def read_docx(path):
+    """DOCX -> Markdown-ish text: headings become '# ', italics '*...*'."""
+    import xml.etree.ElementTree as ET
+
+    with zipfile.ZipFile(path) as z:
+        root = ET.fromstring(z.read("word/document.xml"))
+    w = f"{{{W}}}"
+    paras = []
+    for p in root.iter(w + "p"):
+        style = p.find(f"{w}pPr/{w}pStyle")
+        sv = (style.get(w + "val") or "").lower() if style is not None else ""
+        level = 1 if sv in ("title", "heading1") else 2 if re.fullmatch(r"heading[2-9]", sv) else 0
+        parts = []
+        for r in p.iter(w + "r"):
+            t = "".join(
+                (e.text or "") if e.tag == w + "t" else "\t" if e.tag == w + "tab" else " "
+                for e in r
+                if e.tag in (w + "t", w + "tab", w + "br")
+            )
+            i = r.find(f"{w}rPr/{w}i")
+            italic = i is not None and (i.get(w + "val") or "true") not in ("0", "false")
+            parts.append(f"*{t.strip()}*" + (" " if t.endswith(" ") else "") if italic and t.strip() else t)
+        text = "".join(parts).strip()
+        if text:
+            paras.append(("#" * level + " " if level else "") + text)
+    return "\n\n".join(paras)
+
+
+def write_docx(md, path, lang, title):
+    """Markdown-ish text -> a minimal, valid DOCX (headings, italics, right-to-left where needed)."""
+    rtl = lang.split("-")[0] in ("ar", "ur", "fa", "he")
+    esc = lambda t: html.escape(t, quote=False)  # noqa: E731
+    lang_attr = f'<w:lang w:val="{lang}" w:bidi="{lang}" w:eastAsia="{lang}"/>'
+
+    def runs(text):
+        out = []
+        for i, part in enumerate(re.split(r"\*(.+?)\*", text)):
+            if part:
+                rpr = ("<w:i/><w:iCs/>" if i % 2 else "") + ("<w:rtl/>" if rtl else "") + lang_attr
+                out.append(f'<w:r><w:rPr>{rpr}</w:rPr><w:t xml:space="preserve">{esc(part)}</w:t></w:r>')
+        return "".join(out)
+
+    body = []
+    for para in md.split("\n\n"):
+        para = para.strip()
+        if not para:
+            continue
+        m = re.match(r"(#{1,2}) (.*)", para, re.S)
+        style = f'<w:pStyle w:val="Heading{len(m.group(1))}"/>' if m else ""
+        text = m.group(2) if m else para
+        body.append(f"<w:p><w:pPr>{style}{'<w:bidi/>' if rtl else ''}</w:pPr>{runs(' '.join(text.split()))}</w:p>")
+    doc = (
+        f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="{W}"><w:body>'
+        + "".join(body)
+        + '<w:sectPr><w:pgSz w:w="11906" w:h="16838"/><w:pgMar w:top="1440" w:right="1440" w:bottom="1440"'
+        ' w:left="1440" w:header="708" w:footer="708" w:gutter="0"/></w:sectPr></w:body></w:document>'
     )
+    styles = (
+        f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:styles xmlns:w="{W}">'
+        f'<w:docDefaults><w:rPrDefault><w:rPr><w:sz w:val="24"/><w:szCs w:val="24"/>{lang_attr}</w:rPr></w:rPrDefault>'
+        '<w:pPrDefault><w:pPr><w:spacing w:after="160" w:line="300" w:lineRule="auto"/></w:pPr></w:pPrDefault></w:docDefaults>'
+        '<w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/></w:style>'
+        + "".join(
+            f'<w:style w:type="paragraph" w:styleId="Heading{n}"><w:name w:val="heading {n}"/><w:basedOn w:val="Normal"/>'
+            f'<w:next w:val="Normal"/><w:qFormat/><w:pPr><w:keepNext/><w:spacing w:before="360" w:after="160"/>'
+            f'<w:outlineLvl w:val="{n - 1}"/></w:pPr><w:rPr><w:b/><w:bCs/><w:sz w:val="{sz}"/><w:szCs w:val="{sz}"/></w:rPr></w:style>'
+            for n, sz in ((1, 36), (2, 30))
+        )
+        + "</w:styles>"
+    )
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr(
+            "[Content_Types].xml",
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+            '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+            '<Default Extension="xml" ContentType="application/xml"/>'
+            '<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>'
+            '<Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/>'
+            '<Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-package.core-properties+xml"/>'
+            "</Types>",
+        )
+        z.writestr(
+            "_rels/.rels",
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>'
+            '<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties" Target="docProps/core.xml"/>'
+            "</Relationships>",
+        )
+        z.writestr(
+            "word/_rels/document.xml.rels",
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>'
+            "</Relationships>",
+        )
+        z.writestr(
+            "docProps/core.xml",
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties"'
+            ' xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>'
+            + esc(title)
+            + "</dc:title><dc:language>"
+            + lang
+            + "</dc:language></cp:coreProperties>",
+        )
+        z.writestr("word/document.xml", doc)
+        z.writestr("word/styles.xml", styles)
 
 
 # ---------------------------------------------------------------- cli
@@ -749,6 +990,9 @@ def main():
     s.add_argument("-p", "--project", required=True)
     s.add_argument("--words", type=int, default=2500, help="target words per chunk (default 2500)")
     s.add_argument("--from", default="en", help="source language code (default en)")
+    s.add_argument(
+        "--flat", action="store_true", help="EPUB: rebuild from plain text instead of keeping the original layout"
+    )
     s.add_argument("--lang", default="bn", help=f"target language code (default bn). Built in: {', '.join(LANGS)}")
     for name in ("glossary", "run", "status", "build"):
         s = sub.add_parser(name)
@@ -767,6 +1011,8 @@ def main():
             s.add_argument("--notify", help="command to send status messages, e.g. send-telegram")
         if name == "build":
             s.add_argument("--title")
+            s.add_argument("--layout", choices=["replace", "bilingual"], default="replace",
+                           help="replace the text, or keep each original paragraph followed by its translation")  # fmt: skip
     s = sub.add_parser("ui", help="open the local web UI")
     s.add_argument("--dir", default="tomeshift-projects", help="folder for books (default ./tomeshift-projects)")
     s.add_argument("--host", default="127.0.0.1")

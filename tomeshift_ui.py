@@ -98,7 +98,7 @@ def make_handler(root, langs, backends):
                     review = (d / "review.txt").read_text().splitlines() if (d / "review.txt").exists() else []
                     chunks = sorted((d / "chunks").glob("*.md"))
                     done = sorted((d / "out").glob("*.md"))
-                    files = [f.name for f in d.glob("book_*") if f.suffix in (".epub", ".md")]
+                    files = [f.name for f in d.glob("book_*") if f.suffix in (".epub", ".md", ".docx")]
                     total = (
                         json.loads((d / "manifest.json").read_text())["words"] if (d / "manifest.json").exists() else 0
                     )
@@ -140,7 +140,10 @@ def make_handler(root, langs, backends):
                     self.send_response(200)
                     self.send_header(
                         "Content-Type",
-                        "application/epub+zip" if f.endswith(".epub") else "text/markdown; charset=utf-8",
+                        {
+                            ".epub": "application/epub+zip",
+                            ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                        }.get(Path(f).suffix, "text/markdown; charset=utf-8"),
                     )
                     self.send_header("Content-Disposition", f'attachment; filename="{d.name}-{f}"')
                     data = path.read_bytes()
@@ -164,8 +167,8 @@ def make_handler(root, langs, backends):
                 name = d.name
                 if u.path == "/api/prep":  # body = the raw book file
                     fname = Path(self.headers.get("X-Filename", "book.txt")).name
-                    if Path(fname).suffix.lower() not in (".pdf", ".epub", ".txt", ".md"):
-                        return self.send(400, {"error": "use a .pdf, .epub, .txt or .md file"})
+                    if Path(fname).suffix.lower() not in (".pdf", ".epub", ".docx", ".txt", ".md"):
+                        return self.send(400, {"error": "use a .pdf, .epub, .docx, .txt or .md file"})
                     d.mkdir(parents=True, exist_ok=True)
                     src = d / ("source" + Path(fname).suffix.lower())
                     src.write_bytes(body)
@@ -215,7 +218,9 @@ def make_handler(root, langs, backends):
                     (d / "out" / f"{n}.md").unlink(missing_ok=True)
                     return self.send(200, {"ok": True})
                 if u.path == "/api/build":
-                    step(name, ["build", "-p", str(d)] + (["--title", val("title")] if val("title") else []))
+                    layout = "bilingual" if val("layout") == "bilingual" else "replace"
+                    args = ["build", "-p", str(d), "--layout", layout]
+                    step(name, args + (["--title", val("title")] if val("title") else []))
                     return self.send(200, {"ok": True})
                 self.send(404, {"error": "not found"})
             except (ValueError, OSError, json.JSONDecodeError) as e:
@@ -305,7 +310,7 @@ table{width:100%;border-collapse:collapse}td{padding:3px 4px}td input{width:100%
       <label for="lang">To<select id="lang"></select></label>
       <label for="words">Words per chunk<input type="number" id="words" value="2500" min="300" step="100"></label>
     </div>
-    <div class="drop" id="drop" tabindex="0">Drop a .pdf, .epub, .txt or .md file here, or click to choose<input type="file" id="file" accept=".pdf,.epub,.txt,.md" hidden></div>
+    <div class="drop" id="drop" tabindex="0">Drop a .pdf, .epub, .docx, .txt or .md file here, or click to choose<input type="file" id="file" accept=".pdf,.epub,.docx,.txt,.md" hidden></div>
     <p class="muted" id="prepmsg"></p>
   </div>
 
@@ -318,7 +323,7 @@ table{width:100%;border-collapse:collapse}td{padding:3px 4px}td input{width:100%
     <h2 style="margin-top:16px">2 · Translate with</h2>
     <div class="grid">
       <label for="agent">Backend<select id="agent"></select></label>
-      <label for="model">Model (optional)<input type="text" id="model" placeholder="e.g. sonnet, haiku, gemini-2.5-flash-lite"></label>
+      <label for="model">Model (optional)<input type="text" id="model" placeholder="leave empty for the default"></label>
       <label for="jobs">Parallel chunks<input type="number" id="jobs" value="3" min="1" max="32"></label>
       <label for="fallback">Fallback agent<select id="fallback"><option value="">none</option></select></label>
     </div>
@@ -327,7 +332,8 @@ table{width:100%;border-collapse:collapse}td{padding:3px 4px}td input{width:100%
       <button id="glossbtn">Build glossary</button>
       <button class="primary" id="runbtn">Start translating</button>
       <button class="warn hidden" id="stopbtn">Pause</button>
-      <button id="buildbtn">Build EPUB</button>
+      <select id="layout" aria-label="Book layout" style="width:auto"><option value="replace">Translation only</option><option value="bilingual">Bilingual (original + translation)</option></select>
+      <button id="buildbtn">Build book</button>
       <span id="downloads" class="row"></span>
     </div>
     <p class="muted" id="jobmsg"></p>
@@ -373,7 +379,7 @@ function q(){return `p=${cur}&agents=${encodeURIComponent([$("agent").value,$("f
 $("runbtn").onclick=async()=>{await api("/api/run?"+q(),{method:"POST"});poll()};
 $("stopbtn").onclick=async()=>{await api("/api/stop?p="+cur,{method:"POST"});setTimeout(poll,500)};
 $("glossbtn").onclick=async()=>{await api("/api/glossary?"+q(),{method:"POST"});$("jobmsg").textContent="Building glossary (one model call)…"};
-$("buildbtn").onclick=async()=>{await api("/api/build?p="+cur,{method:"POST"});$("jobmsg").textContent="Building book…"};
+$("buildbtn").onclick=async()=>{await api(`/api/build?p=${cur}&layout=${$("layout").value}`,{method:"POST"});$("jobmsg").textContent="Building book…"};
 async function loadGloss(){const g=await api("/api/glossary?p="+cur);const e=Object.entries(g);$("glosscard").classList.toggle("hidden",!e.length);
  $("glosstab").innerHTML=e.map(([k,v],i)=>`<tr><td><input type="text" value="${k.replace(/"/g,"&quot;")}" aria-label="Source term ${i+1}"></td><td><input type="text" value="${v.replace(/"/g,"&quot;")}" aria-label="Translation ${i+1}"></td></tr>`).join("")}
 $("glosssave").onclick=async()=>{const g={};for(const tr of $("glosstab").rows){const[a,b]=tr.querySelectorAll("input");if(a.value.trim())g[a.value.trim()]=b.value.trim()}

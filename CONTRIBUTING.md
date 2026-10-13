@@ -1,6 +1,6 @@
 # Contributing
 
-Thanks for helping. tomeshift stays small on purpose: `tomeshift.py` (CLI) and `tomeshift_ui.py` (web UI), with one dependency. Please read the [Code of Conduct](CODE_OF_CONDUCT.md).
+Thanks for helping. tomeshift stays small on purpose: `tomeshift.py` (CLI), `tomeshift_epub.py` (in-place EPUB) and `tomeshift_ui.py` (web UI), with one dependency. Please read the [Code of Conduct](CODE_OF_CONDUCT.md).
 
 ## Good first contributions
 
@@ -23,7 +23,7 @@ Run what CI runs:
 
 ```bash
 uvx ruff check . && uvx ruff format --check .        # lint + format
-uvx mypy tomeshift.py tomeshift_ui.py                 # types
+uvx mypy tomeshift.py tomeshift_ui.py tomeshift_epub.py                 # types
 uv run --no-project --with pymupdf --with pytest pytest   # tests
 python3 scripts/check_manifests.py                    # plugin/skill manifests agree
 ```

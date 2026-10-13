@@ -1,7 +1,7 @@
 {
   "name": "tomeshift",
   "description": "Translate a whole book for under a dollar. Any language, any LLM: drives Claude Code, Codex, Gemini CLI, OpenCode, Antigravity or any API, pauses on usage limits and resumes automatically, outputs EPUB.",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "author": { "name": "Hasib Ahmed", "url": "https://github.com/Hasib105" },
   "homepage": "https://github.com/Hasib105/tomeshift",
   "repository": "https://github.com/Hasib105/tomeshift",
