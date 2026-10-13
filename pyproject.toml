@@ -1,7 +1,7 @@
 [project]
 name = "tomeshift"
 version = "0.1.0"
-description = "Translate whole books between any languages with an LLM, as cheaply as possible: via the coding-agent CLIs you already pay for, or any API."
+description = "Translate a whole book for under a dollar: any language, any LLM, or $0 extra on the AI subscription you already have."
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"

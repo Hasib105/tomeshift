@@ -1,4 +1,4 @@
-<p align="center"><img src="assets/banner.svg" alt="tomeshift: translate whole books between any languages" width="100%"></p>
+<p align="center"><img src="assets/banner.svg" alt="tomeshift: translate a whole book for under a dollar" width="100%"></p>
 
 <p align="center">
 <a href="LICENSE"><img alt="MIT license" src="https://img.shields.io/badge/license-MIT-0F766E"></a>
@@ -7,7 +7,7 @@
 
 # tomeshift
 
-**Translate a whole book between any two languages with an LLM, as cheaply as possible.**
+**Translate a whole book for under a dollar.** Any language to any language, with any LLM, or at no extra cost on the AI subscription you already have.
 
 - **Use what you already pay for.** Run on Claude Code, Antigravity, OpenCode, Codex or Gemini CLI subscriptions at no extra cost, or on a pay-per-token API (Gemini, any OpenAI-compatible server, Anthropic).
 - **The LLM only translates.** Extraction, cleanup, chunking, checks and EPUB building are plain Python and cost nothing.
@@ -17,6 +17,20 @@
 ```
 ███████████░░░░░░░░░░░░░░  44.0%  66,120/150,300 words  PAUSED (limit) until 15:01  ETA 2:10:00
 ```
+
+## What a 500-page book costs
+
+That's about 150,000 words: roughly 200k input tokens and 250k–400k output tokens, depending on the target language.
+
+| How you run it | Approx. cost |
+|---|---|
+| Claude Code / Codex / Gemini CLI / Antigravity subscription | **$0 extra** (uses your plan's quota) |
+| OpenCode free models, or a local model via Ollama | **$0** |
+| `gemini-api` with Gemini 2.5 Flash-Lite | **~$0.20** |
+| `openai-api` with GPT-4o-mini | **~$0.30** |
+| `gemini-api` with Gemini 2.5 Flash (higher quality) | ~$1 |
+
+Estimates use published list prices at the time of writing plus ~10% for retries. Check your provider's current pricing. Pick the cheapest model whose 10-page sample you're happy with.
 
 ## Quick start
 
