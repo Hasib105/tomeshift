@@ -1,0 +1,6 @@
+projects/
+__pycache__/
+*.pyc
+.venv/
+dist/
+uv.lock

@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-label="tomeshift logo"><g transform="translate(0 0) scale(1.0)">
+  <rect width="512" height="512" rx="112" fill="#13232E"/>
+  <path d="M256 168 C214 140 150 132 92 140 L92 392 C150 384 214 392 256 420 Z" fill="#F7F4EC"/>
+  <path d="M256 168 C298 140 362 132 420 140 L420 392 C362 384 298 392 256 420 Z" fill="#E7F3F1"/>
+  <path d="M256 168 L256 420" stroke="#13232E" stroke-width="6" stroke-linecap="round" opacity=".25"/>
+  <path transform="translate(117.7 331.5) scale(0.0732 -0.0732)" d="M428 73V0H20V73L120 100L597 1352H887L1362 100L1464 73V0H867V73L1022 100L894 447H379L256 100ZM641 1150 420 557H856Z" fill="#13232E"/>
+  <path transform="translate(295.4 328.1) scale(0.1500 -0.1500)" d="M226 511Q307 511 361.0 454.5Q415 398 415 310L473 209V538H-20V588H614V538H523V26Q515 34 508.0 47.5Q501 61 498.0 70.5Q495 80 490.5 95.5Q486 111 485 115L478 135Q461 159 447.0 182.0Q433 205 425.0 216.0Q417 227 400 240Q359 163 270 163Q189 163 118.5 254.0Q48 345 8 512L39 499Q68 378 134.5 313.5Q201 249 278 249Q324 249 343.0 273.0Q362 297 362 331Q362 370 345.5 398.5Q329 427 311 427Q278 377 233 377Q213 377 188.5 392.5Q164 408 164 441Q164 452 168.0 466.0Q172 480 187.0 495.5Q202 511 226 511Z" fill="#0F766E" stroke="#0F766E" stroke-width="60" stroke-linejoin="round"/>
+  <path d="M150 112 C210 52 302 52 362 112" fill="none" stroke="#F2A33A" stroke-width="22" stroke-linecap="round"/>
+  <path d="M338 76 L376 124 L318 132 Z" fill="#F2A33A" stroke="#F2A33A" stroke-width="8" stroke-linejoin="round"/>
+</g></svg>
