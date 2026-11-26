@@ -225,9 +225,10 @@ def make_handler(root, langs, backends):
                     if name in RUNS and RUNS[name].poll() is None:
                         RUNS[name].terminate()
                     return self.send(200, {"ok": True})
-                if u.path == "/api/redo":  # delete one translation so the next run redoes it
+                if u.path == "/api/redo":  # forget one translation (memory too) so the next run redoes it
                     n = re.sub(r"\D", "", val("n"))
-                    (d / "out" / f"{n}.md").unlink(missing_ok=True)
+                    if n:
+                        subprocess.run([*CLI, "redo", "-p", str(d), n], capture_output=True)
                     return self.send(200, {"ok": True})
                 if u.path == "/api/build":
                     layout = "bilingual" if val("layout") == "bilingual" else "replace"

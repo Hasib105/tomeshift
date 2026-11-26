@@ -157,6 +157,8 @@ tomeshift run -p mybook --agents claude,agy --fallback   # use agy while Claude 
 3. **Tiny prompts for agents.** Claude Code's large default system prompt, tools, MCP servers and skills are switched off, and every agent runs in an empty directory so it doesn't load your `CLAUDE.md`/`AGENTS.md`.
 4. **No full second pass.** Every chunk is checked automatically: right script, little leftover English, sane length ratio, paragraphs intact, glossary followed. Only failing chunks are retried, with the reason included. Anything still failing is listed in `review.txt` for you.
 5. **Parallel-safe context.** Each chunk gets the previous chunk's last two source paragraphs inside a `<context>` tag, so chunks can run in parallel without losing continuity. If the model translates the context by mistake, the check catches it and the chunk is retried.
+6. **Never pay twice.** Every accepted paragraph goes into `memory.jsonl`, keyed by its source text. Re-running `prep` (another `--words`, a fixed PDF) keeps the work already done: chunks whose paragraphs are all known are filled for free, and partly known chunks send only the missing paragraphs.
+7. **No hidden thinking.** Reasoning tokens are billed as output, so thinking is switched off or set to its lowest level: Gemini 2.x budget 0, Gemini 3.x `minimal` (`low` for Pro), and `reasoning_effort=low` for OpenAI-compatible servers (set `TOMESHIFT_REASONING` to change it). A server that rejects the setting is retried once without it.
 
 A 500-page book is about 150k words, or roughly 60 chunks at the default size of 2,500 words.
 
@@ -173,7 +175,8 @@ A 500-page book is about 150k words, or roughly 60 chunks at the default size of
 ```
 mybook/
   chunks/0001.md ...   source chunks (edit freely before running)
-  out/0001.md ...      translations (delete one to redo it)
+  out/0001.md ...      translations (`tomeshift redo -p mybook 3` redoes chunk 3)
+  memory.jsonl         every accepted paragraph translation, reused after re-prep
   glossary.json        English -> target terms (edit before `run`)
   TRANSLATE.md         optional: your own instructions for this book
   manifest.json  progress.json  run.log  review.txt

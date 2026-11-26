@@ -4,6 +4,18 @@ All notable changes are listed here. The format follows [Keep a Changelog](https
 
 ## [Unreleased]
 
+### Added
+- **Translation memory** (`memory.jsonl`): accepted paragraphs are reused, so re-running `prep` with other settings doesn't pay for finished work again. Partly known chunks send only their missing paragraphs.
+- `tomeshift redo -p PROJECT N...` forgets chunk translations, memory included. The UI's redo button uses it.
+
+### Changed
+- Thinking is off or minimal for API backends: Gemini 3.x gets `thinkingLevel` (2.x keeps budget 0), OpenAI-compatible servers get `reasoning_effort=low` (`TOMESHIFT_REASONING`), and a server that rejects an optional setting is retried without it. Gemini thinking tokens are now counted as output.
+- Re-running `prep` keeps translations whose chunk didn't change and drops the rest, instead of leaving outputs that no longer match their chunk.
+
+### Fixed
+- opencode: the removed `--pure` flag is gone and the prompt goes over stdin.
+- Windows: npm `.cmd` CLIs start, project files are read and written as UTF-8, and the progress bar no longer crashes cp1252 consoles.
+
 ## [0.3.0] - 2026-10-13
 
 ### Added

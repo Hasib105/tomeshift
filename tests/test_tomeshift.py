@@ -7,6 +7,7 @@ import sys
 import tempfile
 import threading
 import unittest
+import unittest.mock
 from datetime import datetime, timezone
 from http.server import HTTPServer
 from pathlib import Path
@@ -224,11 +225,83 @@ class Docx(unittest.TestCase):
             self.assertTrue(doc.paragraphs[1].runs[1].italic)
 
 
+sys.path.insert(0, str(ROOT / "tests"))
+import mock_openai
+
+
+class Thinking(unittest.TestCase):
+    def test_gemini_thinking_config(self):
+        self.assertEqual(ts.gemini_thinking("gemini-2.5-flash"), {"thinkingBudget": 0})
+        self.assertEqual(ts.gemini_thinking("gemini-3.5-flash-lite"), {"thinkingLevel": "minimal"})
+        self.assertEqual(ts.gemini_thinking("gemini-3.1-pro"), {"thinkingLevel": "low"})  # Pro has no "minimal"
+
+    def test_openai_drops_refused_reasoning_param(self):
+        srv = HTTPServer(("127.0.0.1", 0), mock_openai.H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        mock_openai.calls = 1  # skip the mock's opening 429
+        base = f"http://127.0.0.1:{srv.server_port}/v1"
+        with unittest.mock.patch.dict(os.environ, {"OPENAI_BASE_URL": base}):
+            text, _, _ = ts.api_openai("plain", "sys", "<passage>\nHello there\n</passage>", 30)
+            self.assertEqual(text, "অনুবাদ অনুবাদ")
+            self.assertEqual(ts._REJECTED[(base, "plain")], {"reasoning_effort"})
+            calls = mock_openai.calls
+            ts.api_openai("plain", "sys", "<passage>\nHi\n</passage>", 30)
+            self.assertEqual(mock_openai.calls, calls + 1)  # remembered: no second 400
+        srv.shutdown()
+
+
+class TranslationMemory(unittest.TestCase):
+    def setUp(self):
+        self.srv = HTTPServer(("127.0.0.1", 0), mock_openai.H)
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+        mock_openai.calls = 1  # skip the mock's opening 429
+        mock_openai.passages.clear()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.d = Path(self.tmp.name)
+        self.env = {**os.environ, "OPENAI_BASE_URL": f"http://127.0.0.1:{self.srv.server_port}/v1"}
+
+    def tearDown(self):
+        self.srv.shutdown()
+        self.tmp.cleanup()
+
+    def cli(self, *a):
+        r = subprocess.run([sys.executable, str(ROOT / "tomeshift.py"), *a], env=self.env, capture_output=True,
+                           text=True, encoding="utf-8", timeout=120)  # fmt: skip
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def prep_and_run(self, book, words):
+        self.cli("prep", str(book), "-p", str(self.d / "p"), "--words", str(words))
+        self.cli("run", "-p", str(self.d / "p"), "--agents", "openai-api", "-j", "2")
+        chunks = list((self.d / "p/chunks").glob("*.md"))
+        self.assertEqual(len(list((self.d / "p/out").glob("*.md"))), len(chunks))
+
+    def test_rechunking_reuses_translations(self):
+        self.prep_and_run(ROOT / "samples/alice.txt", 150)
+        paid = len(mock_openai.passages)
+        self.assertGreater(paid, 1)
+        self.prep_and_run(ROOT / "samples/alice.txt", 100)  # different chunks, same paragraphs
+        self.assertEqual(len(mock_openai.passages), paid)  # nothing sent again
+        # one new paragraph: only that paragraph goes to the model
+        book = self.d / "alice2.txt"
+        extra = "A brand new closing paragraph, added later."
+        book.write_text((ROOT / "samples/alice.txt").read_text(encoding="utf-8") + "\n\n" + extra + "\n", "utf-8")
+        self.prep_and_run(book, 100)
+        self.assertEqual(len(mock_openai.passages), paid + 1)
+        self.assertEqual(ts.MARKERS.sub("", mock_openai.passages[-1]).strip(), extra)
+        self.assertNotIn("[[", ts.book_paragraphs(self.d / "p")[-1][1])  # tags never reach the book
+
+    def test_redo_forgets(self):
+        self.prep_and_run(ROOT / "samples/alice.txt", 150)
+        paid = len(mock_openai.passages)
+        self.cli("redo", "-p", str(self.d / "p"), "1")
+        self.assertFalse((self.d / "p/out/0001.md").exists())
+        self.cli("run", "-p", str(self.d / "p"), "--agents", "openai-api")
+        self.assertEqual(len(mock_openai.passages), paid + 1)
+
+
 class EndToEnd(unittest.TestCase):
     def test_mock_api_run_with_429(self):
-        sys.path.insert(0, str(ROOT / "tests"))
-        import mock_openai
-
+        mock_openai.calls = 0  # the first request gets a 429
         srv = HTTPServer(("127.0.0.1", 0), mock_openai.H)
         threading.Thread(target=srv.serve_forever, daemon=True).start()
         with tempfile.TemporaryDirectory() as d:

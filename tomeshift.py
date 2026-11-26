@@ -199,6 +199,14 @@ def _need(var):
     return os.environ[var]
 
 
+def gemini_thinking(model):
+    """Thinking tokens are billed as output. Gemini 2.x turns it off with budget 0; 3.x+ only takes a level
+    (default "high"), and Pro models have no "minimal"."""
+    if re.match(r"gemini-[012]\.", model):
+        return {"thinkingBudget": 0}
+    return {"thinkingLevel": "low" if "pro" in model else "minimal"}
+
+
 def api_gemini(model, system, user, timeout):
     model = model or "gemini-2.5-flash"
     r = _post(
@@ -206,7 +214,11 @@ def api_gemini(model, system, user, timeout):
         {
             "systemInstruction": {"parts": [{"text": system}]},
             "contents": [{"role": "user", "parts": [{"text": user}]}],
-            "generationConfig": {"temperature": 0.3, "maxOutputTokens": 32768, "thinkingConfig": {"thinkingBudget": 0}},
+            "generationConfig": {
+                "temperature": 0.3,
+                "maxOutputTokens": 32768,
+                "thinkingConfig": gemini_thinking(model),
+            },
         },
         {"x-goog-api-key": _need("GEMINI_API_KEY")},
         timeout,
@@ -218,8 +230,11 @@ def api_gemini(model, system, user, timeout):
     return (
         "".join(p.get("text", "") for p in cand.get("content", {}).get("parts", [])),
         u.get("promptTokenCount", 0),
-        u.get("candidatesTokenCount", 0),
+        u.get("candidatesTokenCount", 0) + u.get("thoughtsTokenCount", 0),  # thinking is billed as output
     )
+
+
+_REJECTED: dict[tuple, set] = {}  # (server, model) -> optional params that server refused
 
 
 def api_openai(model, system, user, timeout):
@@ -228,16 +243,24 @@ def api_openai(model, system, user, timeout):
     key = os.environ.get("OPENAI_API_KEY", "none" if "localhost" in base or "127.0.0.1" in base else None) or _need(
         "OPENAI_API_KEY"
     )
-    r = _post(
-        f"{base}/chat/completions",
-        {
-            "model": model or "gpt-4o-mini",
-            "temperature": 0.3,
-            "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
-        },
-        {"Authorization": f"Bearer {key}"},
-        timeout,
-    )
+    model = model or "gpt-4o-mini"
+    body = {
+        "model": model,
+        "temperature": 0.3,
+        # Reasoning models think at "medium" by default, billed as output tokens. Translation doesn't need it.
+        "reasoning_effort": os.environ.get("TOMESHIFT_REASONING", "low"),
+        "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+    }
+    optional = [p for p in ("reasoning_effort", "temperature") if body[p] and p not in _REJECTED.get((base, model), ())]
+    body = {k: v for k, v in body.items() if k in optional or k in ("model", "messages")}
+    try:
+        r = _post(f"{base}/chat/completions", body, {"Authorization": f"Bearer {key}"}, timeout)
+    except RuntimeError as e:  # servers differ on which optional params they accept: drop the refused one
+        refused = [p for p in optional if p in str(e)]
+        if not str(e).startswith("HTTP 400") or not refused:
+            raise
+        _REJECTED.setdefault((base, model), set()).update(refused)
+        return api_openai(model, system, user, timeout)
     ch = r["choices"][0]
     if ch.get("finish_reason") == "length":
         raise RuntimeError("output cut off (length) - use smaller --words")
@@ -450,10 +473,24 @@ def cmd_prep(a):
         chunks.append(cur)
     (proj / "chunks").mkdir(parents=True, exist_ok=True)
     (proj / "out").mkdir(exist_ok=True)
-    for old in (proj / "chunks").glob("*.md"):
-        old.unlink()
-    for i, c in enumerate(chunks, 1):
-        (proj / "chunks" / f"{i:04d}.md").write_text("\n\n".join(c) + "\n", encoding="utf-8")
+    old = {c.name: c.read_text(encoding="utf-8") for c in (proj / "chunks").glob("*.md")}
+    # Re-chunking: keep finished translations in the memory, so the next run reuses them instead of paying again.
+    review = proj / "review.txt"
+    flagged = {ln.split(":")[0] for ln in review.read_text(encoding="utf-8").splitlines()} if review.exists() else set()
+    mem, learned = load_memory(proj), []
+    for name, text in old.items():
+        o = proj / "out" / name
+        if o.exists() and name[:-3] not in flagged:
+            learned += [(s, t) for s, t in pairs(text, o.read_text(encoding="utf-8")) if mem.get(s) != t]
+    remember(proj, learned)
+    new = {f"{i:04d}.md": "\n\n".join(c) + "\n" for i, c in enumerate(chunks, 1)}
+    for name in old:
+        (proj / "chunks" / name).unlink()
+    for name, text in new.items():
+        (proj / "chunks" / name).write_text(text, encoding="utf-8")
+    for o in (proj / "out").glob("*.md"):  # a translation only stays if its chunk is unchanged
+        if old.get(o.name) != new.get(o.name):
+            o.unlink()
     total = sum(len(MARKERS.sub(" ", " ".join(c)).split()) for c in chunks)
     src_lang = getattr(a, "from")
     manifest = {"source": str(src.resolve()), "lang": a.lang, "from": src_lang, "chunks": len(chunks), "words": total,
@@ -561,11 +598,11 @@ def check(src, out, gloss, src_code, tgt_code):
     src_script = lang_info(src_code)[1] or LATIN
     if tgt_script.pattern != src_script.pattern:  # different scripts: we can tell languages apart
         native, left = len(tgt_script.findall(out)), len(src_script.findall(out))
-        if native < 50:
+        if native < min(50, len(src_script.findall(src)) // 3):  # short passages: a heading, a few lines
             return ["output is not in the target language"]
         if left > 0.15 * (native + left):
             problems.append(f"too much untranslated source text ({left} source-script letters)")
-    if not ({src_code, tgt_code} & DENSE):
+    if len(src) > 200 and not ({src_code, tgt_code} & DENSE):
         ratio = len(out) / max(1, len(src))
         if not 0.55 < ratio < 2.2:
             problems.append(f"length ratio {ratio:.2f} looks wrong (truncated or padded)")
@@ -578,6 +615,47 @@ def check(src, out, gloss, src_code, tgt_code):
     if len(missed) > 2:
         problems.append("glossary not followed: " + "; ".join(missed[:8]))
     return problems
+
+
+# ---------------------------------------------------------------- translation memory
+# memory.jsonl keeps every accepted paragraph (EPUB: segment) translation, keyed by its source text, so the
+# same text is never paid for twice: not after re-running prep with other settings, nor in a later run.
+def units(text):
+    """Chunk text -> [(segment id or None, source text)]: EPUB segments by [[id]], otherwise paragraphs."""
+    segs = split_segments(text)
+    if segs:
+        return list(segs.items())
+    return [(None, p.strip()) for p in text.split("\n\n") if p.strip()]
+
+
+def pairs(src, out):
+    """[(source unit, translation)], or [] when the output can't be lined up unit by unit."""
+    s, o = units(src), units(out)
+    if s and s[0][0] is not None:
+        tr = dict(o)
+        return [(u, tr[i]) for i, u in s if i in tr]
+    return [(a, b) for (_, a), (_, b) in zip(s, o, strict=True)] if len(s) == len(o) else []
+
+
+def load_memory(proj):
+    mem, f = {}, Path(proj) / "memory.jsonl"
+    for line in f.read_text(encoding="utf-8").splitlines() if f.exists() else []:
+        try:
+            e = json.loads(line)
+        except ValueError:  # a line cut short by a kill
+            continue
+        if e.get("tr"):
+            mem[e["src"]] = e["tr"]
+        else:
+            mem.pop(e["src"], None)
+    return mem
+
+
+def remember(proj, items):
+    """Append [(source, translation)] to the memory; a translation of None forgets that source."""
+    if items:
+        with (Path(proj) / "memory.jsonl").open("a", encoding="utf-8") as f:
+            f.writelines(json.dumps({"src": s, "tr": t}, ensure_ascii=False) + "\n" for s, t in items)
 
 
 # ---------------------------------------------------------------- run
@@ -600,6 +678,7 @@ class Runner:
         self.lang = project_lang(self.proj)
         self.src_lang = project_lang(self.proj, "from")
         self.rules = rules_for(self.lang, self.proj, self.src_lang)
+        self.memory = load_memory(self.proj)
 
     def done_words(self):
         return sum(w for s, w in self.words.items() if (self.proj / "out" / f"{s}.md").exists())
@@ -663,7 +742,17 @@ class Runner:
         dest = self.proj / "out" / f"{chunk.stem}.md"
         if dest.exists():
             return
-        src = chunk.read_text(encoding="utf-8")
+        full = chunk.read_text(encoding="utf-8")
+        parts = units(full)
+        epub = bool(parts) and parts[0][0] is not None
+        known = {k: self.memory[u] for k, (_, u) in enumerate(parts) if u in self.memory}
+        if parts and len(known) == len(parts):
+            self.save(dest, full, self.assemble(parts, known, {}, epub), [])
+            self.log(chunk.stem, "memory", "all from translation memory")
+            return
+        # Send only what the memory lacks, tagged [[k]] (EPUB: its segment id) so the reply merges back in place.
+        src = "\n\n".join(f"[[{i if epub else k}]] {u}" for k, (i, u) in enumerate(parts) if k not in known)
+        src = src + "\n" if known else full
         terms = {k: v for k, v in self.gloss.items() if k in src}  # only terms this chunk uses
         system = self.rules + (
             "\n\nGlossary (use exactly):\n" + "\n".join(f"{k} = {v}" for k, v in terms.items()) if terms else ""
@@ -690,7 +779,10 @@ class Runner:
                 continue
             problems = check(src, out, terms, self.src_lang, self.lang)
             if not problems or attempt == self.a.retries:
-                dest.write_text(out, encoding="utf-8")
+                if known:
+                    self.log(chunk.stem, agent, f"{len(known)} of {len(parts)} paragraphs from translation memory")
+                    out = self.assemble(parts, known, split_segments(out), epub)
+                self.save(dest, full, out, problems)
                 if problems:
                     self.log(chunk.stem, agent, "accepted with problems: " + " | ".join(problems))
                     with (self.proj / "review.txt").open("a", encoding="utf-8") as f:
@@ -698,6 +790,28 @@ class Runner:
                 return
             self.log(chunk.stem, agent, "retry: " + " | ".join(problems))
             feedback = "Your previous attempt had these problems, fix them: " + "; ".join(problems) + "\n\n"
+
+    @staticmethod
+    def assemble(parts, known, new, epub):
+        """Chunk output in source order from memory hits + the model's [[k]]-tagged reply. A unit the model
+        dropped stays out in EPUB mode (build keeps the original there) and stays in the source language otherwise."""
+        rows = []
+        for k, (i, u) in enumerate(parts):
+            tr = known.get(k) or new.get(i if epub else k)
+            if epub and tr:
+                rows.append(f"[[{i}]] {tr}")
+            elif not epub:
+                rows.append(tr or u)
+        return "\n\n".join(rows) + "\n"
+
+    def save(self, dest, src, out, problems):
+        dest.write_text(out, encoding="utf-8")
+        if problems:  # only clean translations are worth reusing
+            return
+        learned = [(s, t) for s, t in pairs(src, out) if self.memory.get(s) != t]
+        with self.lock:
+            self.memory.update(learned)
+            remember(self.proj, learned)
 
     def log(self, stem, agent, msg):
         with self.lock, (self.proj / "run.log").open("a", encoding="utf-8") as f:
@@ -735,6 +849,16 @@ def cmd_run(a):
         if n not in AGENTS or not shutil.which(AGENTS[n](None, "", "")[0][0]):
             sys.exit(f"backend {n!r} not available (choose from {', '.join(BACKENDS)})")
     Runner(a).go()
+
+
+def cmd_redo(a):
+    """Throw away chunk translations, memory included, so the next run translates them fresh."""
+    proj = Path(a.project)
+    for n in a.chunks:
+        chunk = proj / "chunks" / f"{int(n):04d}.md"
+        if chunk.exists():
+            remember(proj, [(u, None) for _, u in units(chunk.read_text(encoding="utf-8"))])
+        (proj / "out" / chunk.name).unlink(missing_ok=True)
 
 
 def cmd_status(a):
@@ -1026,6 +1150,9 @@ def main():
             s.add_argument("--title")
             s.add_argument("--layout", choices=["replace", "bilingual"], default="replace",
                            help="replace the text, or keep each original paragraph followed by its translation")  # fmt: skip
+    s = sub.add_parser("redo", help="forget chunk translations (and their memory) so the next run redoes them")
+    s.add_argument("-p", "--project", required=True)
+    s.add_argument("chunks", nargs="+", help="chunk numbers, e.g. 3 17")
     s = sub.add_parser("ui", help="open the local web UI")
     s.add_argument("--dir", default="tomeshift-projects", help="folder for books (default ./tomeshift-projects)")
     s.add_argument("--host", default="127.0.0.1")
@@ -1038,6 +1165,7 @@ def main():
         "run": cmd_run,
         "status": cmd_status,
         "build": cmd_build,
+        "redo": cmd_redo,
         "ui": cmd_ui,
     }[a.cmd](a)
 
