@@ -38,7 +38,7 @@ def make_handler(root, langs, backends):
         JOBS[name] = {"step": args[0], "ok": None, "out": ""}
 
         def go():
-            r = subprocess.run(CLI + args, capture_output=True, text=True)
+            r = subprocess.run(CLI + args, capture_output=True, text=True, encoding="utf-8", errors="replace")
             JOBS[name] = {"step": args[0], "ok": r.returncode == 0, "out": (r.stdout + r.stderr).strip()[-1500:]}
 
         threading.Thread(target=go, daemon=True).start()
@@ -80,13 +80,13 @@ def make_handler(root, langs, backends):
                 if u.path == "/api/projects":
                     out = []
                     for d in sorted(root.glob("*/manifest.json")):
-                        m = json.loads(d.read_text())
+                        m = json.loads(d.read_text(encoding="utf-8"))
                         pr = d.parent / "progress.json"
                         out.append(
                             {
                                 "name": d.parent.name,
                                 **m,
-                                "progress": json.loads(pr.read_text()) if pr.exists() else None,
+                                "progress": json.loads(pr.read_text(encoding="utf-8")) if pr.exists() else None,
                                 "running": d.parent.name in RUNS and RUNS[d.parent.name].poll() is None,
                             }
                         )
@@ -94,18 +94,28 @@ def make_handler(root, langs, backends):
                 if u.path == "/api/status":
                     d = proj(q)
                     pr = d / "progress.json"
-                    log = (d / "run.log").read_text().splitlines()[-12:] if (d / "run.log").exists() else []
-                    review = (d / "review.txt").read_text().splitlines() if (d / "review.txt").exists() else []
+                    log = (
+                        (d / "run.log").read_text(encoding="utf-8").splitlines()[-12:]
+                        if (d / "run.log").exists()
+                        else []
+                    )
+                    review = (
+                        (d / "review.txt").read_text(encoding="utf-8").splitlines()
+                        if (d / "review.txt").exists()
+                        else []
+                    )
                     chunks = sorted((d / "chunks").glob("*.md"))
                     done = sorted((d / "out").glob("*.md"))
                     files = [f.name for f in d.glob("book_*") if f.suffix in (".epub", ".md", ".docx")]
                     total = (
-                        json.loads((d / "manifest.json").read_text())["words"] if (d / "manifest.json").exists() else 0
+                        json.loads((d / "manifest.json").read_text(encoding="utf-8"))["words"]
+                        if (d / "manifest.json").exists()
+                        else 0
                     )
                     return self.send(
                         200,
                         {
-                            "progress": json.loads(pr.read_text())
+                            "progress": json.loads(pr.read_text(encoding="utf-8"))
                             if pr.exists()
                             else {"percent": 0, "status": "not started", "total_words": total},
                             "running": d.name in RUNS and RUNS[d.name].poll() is None,
@@ -121,15 +131,15 @@ def make_handler(root, langs, backends):
                     )
                 if u.path == "/api/glossary":
                     g = proj(q) / "glossary.json"
-                    return self.send(200, json.loads(g.read_text()) if g.exists() else {})
+                    return self.send(200, json.loads(g.read_text(encoding="utf-8")) if g.exists() else {})
                 if u.path == "/api/chunk":
                     d, n = proj(q), re.sub(r"\D", "", q.get("n", [""])[0])
                     src, out = d / "chunks" / f"{n}.md", d / "out" / f"{n}.md"
                     return self.send(
                         200,
                         {
-                            "src": src.read_text() if src.exists() else "",
-                            "out": out.read_text() if out.exists() else "",
+                            "src": src.read_text(encoding="utf-8") if src.exists() else "",
+                            "out": out.read_text(encoding="utf-8") if out.exists() else "",
                         },
                     )
                 if u.path == "/api/download":
@@ -191,7 +201,9 @@ def make_handler(root, langs, backends):
                 if u.path == "/api/glossary":
                     if body:  # save edited glossary
                         data = json.loads(body)
-                        (d / "glossary.json").write_text(json.dumps(data, ensure_ascii=False, indent=1))
+                        (d / "glossary.json").write_text(
+                            json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8"
+                        )
                         return self.send(200, {"ok": True, "terms": len(data)})
                     args = ["glossary", "-p", str(d), "--agents", val("agents", "claude")]
                     if val("model"):
@@ -213,9 +225,10 @@ def make_handler(root, langs, backends):
                     if name in RUNS and RUNS[name].poll() is None:
                         RUNS[name].terminate()
                     return self.send(200, {"ok": True})
-                if u.path == "/api/redo":  # delete one translation so the next run redoes it
+                if u.path == "/api/redo":  # forget one translation (memory too) so the next run redoes it
                     n = re.sub(r"\D", "", val("n"))
-                    (d / "out" / f"{n}.md").unlink(missing_ok=True)
+                    if n:
+                        subprocess.run([*CLI, "redo", "-p", str(d), n], capture_output=True)
                     return self.send(200, {"ok": True})
                 if u.path == "/api/build":
                     layout = "bilingual" if val("layout") == "bilingual" else "replace"
@@ -236,7 +249,14 @@ ICON = (
     '<path d="M150 112C210 52 302 52 362 112" fill="none" stroke="#F2A33A" stroke-width="26" stroke-linecap="round"/></svg>'
 )
 API_BACKENDS = {"gemini-api", "openai-api", "anthropic-api", "cmd"}
-CMD_OF = {"claude": "claude", "agy": "agy", "opencode": "opencode", "codex": "codex", "gemini": "gemini"}
+CMD_OF = {
+    "claude": "claude",
+    "cursor": "agent",
+    "agy": "agy",
+    "opencode": "opencode",
+    "codex": "codex",
+    "gemini": "gemini",
+}
 
 
 def serve(root, host, port, langs, backends, open_browser=True):

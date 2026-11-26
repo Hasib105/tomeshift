@@ -7,6 +7,7 @@ import sys
 import tempfile
 import threading
 import unittest
+import unittest.mock
 from datetime import datetime, timezone
 from http.server import HTTPServer
 from pathlib import Path
@@ -86,9 +87,9 @@ class TextPrep(unittest.TestCase):
             )
             chunks = sorted(Path(d, "chunks").glob("*.md"))
             self.assertEqual(len(chunks), 3)
-            self.assertTrue(chunks[2].read_text().startswith("# CHAPTER II"))
+            self.assertTrue(chunks[2].read_text(encoding="utf-8").startswith("# CHAPTER II"))
             for c in chunks:  # pretend-translate: copy the source
-                Path(d, "out", c.name).write_text(c.read_text())
+                Path(d, "out", c.name).write_text(c.read_text(encoding="utf-8"), encoding="utf-8")
             ts.cmd_build(argparse.Namespace(project=d, title="Alice"))
             epub = Path(d, "book_bn.epub")
             with zipfile.ZipFile(epub) as z:
@@ -105,7 +106,9 @@ def fake_translate(project):
     import re
 
     for c in Path(project, "chunks").glob("*.md"):
-        Path(project, "out", c.name).write_text(re.sub(r"[A-Za-z]+", "অনুবাদ", c.read_text()))
+        Path(project, "out", c.name).write_text(
+            re.sub(r"[A-Za-z]+", "অনুবাদ", c.read_text(encoding="utf-8")), encoding="utf-8"
+        )
 
 
 class EpubInPlace(unittest.TestCase):
@@ -135,7 +138,7 @@ class EpubInPlace(unittest.TestCase):
             return z.read(member)
 
     def test_segments_and_markers(self):
-        chunk = (self.d / "p/chunks/0001.md").read_text()
+        chunk = (self.d / "p/chunks/0001.md").read_text(encoding="utf-8")
         self.assertIn("[[2]] Alice was beginning to get ⟦1⟧very⟦/1⟧ tired", chunk)
         self.assertIn("The White Rabbit with a watch", chunk)  # img alt
         self.assertIn("Loose words in a box.", chunk)  # text next to block elements
@@ -156,7 +159,7 @@ class EpubInPlace(unittest.TestCase):
             for n in z.namelist():
                 if n.endswith((".xhtml", ".opf", ".ncx")):
                     xml.dom.minidom.parseString(z.read(n))  # still well-formed
-        ch = self.read("book_bn.epub", "OEBPS/text/ch1.xhtml").decode()
+        ch = self.read("book_bn.epub", "OEBPS/text/ch1.xhtml").decode("utf-8")
         self.assertTrue(ch.startswith('<?xml version="1.0" encoding="utf-8"?>\n<!DOCTYPE html>'))
         self.assertIn('lang="bn"', ch)
         self.assertIn("<strong>অনুবাদ <em>অনুবাদ</em></strong>", ch)
@@ -164,29 +167,31 @@ class EpubInPlace(unittest.TestCase):
         self.assertIn('print("do not translate me")', ch)
         self.assertIn('alt="অনুবাদ', ch)
         self.assertNotIn("Alice", ch)
-        opf = self.read("book_bn.epub", "OEBPS/content.opf").decode()
+        opf = self.read("book_bn.epub", "OEBPS/content.opf").decode("utf-8")
         self.assertIn("<dc:language>bn</dc:language>", opf)
         self.assertNotIn("Alice in Wonderland", opf)
-        self.assertNotIn("Rabbit-Hole", self.read("book_bn.epub", "OEBPS/toc.ncx").decode())
-        self.assertNotIn("Rabbit-Hole", self.read("book_bn.epub", "OEBPS/nav.xhtml").decode())
+        self.assertNotIn("Rabbit-Hole", self.read("book_bn.epub", "OEBPS/toc.ncx").decode("utf-8"))
+        self.assertNotIn("Rabbit-Hole", self.read("book_bn.epub", "OEBPS/nav.xhtml").decode("utf-8"))
 
     def test_bilingual_layout(self):
         import re
 
         self.build("bilingual")
-        ch = self.read("book_bn_bilingual.epub", "OEBPS/text/ch1.xhtml").decode()
+        ch = self.read("book_bn_bilingual.epub", "OEBPS/text/ch1.xhtml").decode("utf-8")
         self.assertIn("Alice was", ch)  # original kept
         self.assertIn('<p class="first" lang="bn" xml:lang="bn">অনুবাদ', ch)  # translation right after it
         ids = re.findall(r' id="([^"]+)"', ch)
         self.assertEqual(len(ids), len(set(ids)), "duplicate ids")
-        md = (self.d / "p/book_bn_bilingual.md").read_text()
+        md = (self.d / "p/book_bn_bilingual.md").read_text(encoding="utf-8")
         self.assertLess(md.index("Alice was"), md.index("অনুবাদ অনুবাদ অনুবাদ অনুবাদ অনুবাদ"))
 
     def test_broken_markers_fall_back_safely(self):
         out = self.d / "p/out/0001.md"
-        out.write_text(out.read_text().replace("⟦/1⟧", "", 1))  # model dropped a closing marker
+        out.write_text(
+            out.read_text(encoding="utf-8").replace("⟦/1⟧", "", 1), encoding="utf-8"
+        )  # model dropped a closing marker
         self.build("replace")
-        ch = self.read("book_bn.epub", "OEBPS/text/ch1.xhtml").decode()
+        ch = self.read("book_bn.epub", "OEBPS/text/ch1.xhtml").decode("utf-8")
         self.assertIn('<a href="#n1" id="r1"', ch)  # the footnote link survives the fallback
         self.assertNotIn("⟦", ch)
 
@@ -220,11 +225,192 @@ class Docx(unittest.TestCase):
             self.assertTrue(doc.paragraphs[1].runs[1].italic)
 
 
+sys.path.insert(0, str(ROOT / "tests"))
+import mock_openai
+
+
+class Repair(unittest.TestCase):
+    def test_line_up_and_blame(self):
+        sent = [(0, 0, "One"), (1, 1, "Two")]
+        self.assertEqual(ts.line_up(sent, "প্রসঙ্গ\n\n[[0]] এক\n\n[[1]] দুই"), {0: "এক", 1: "দুই"})
+        self.assertEqual(ts.line_up(sent, "প্রসঙ্গ\n\nএক\n\nদুই", context=True), {0: "এক", 1: "দুই"})
+        self.assertEqual(ts.line_up(sent, "প্রসঙ্গ\n\nএক\n\nদুই"), {})  # no context was sent: don't drop real text
+        self.assertEqual(ts.line_up(sent, "এক\n\nদুই"), {0: "এক", 1: "দুই"})  # a CLI that ignores [[tags]]
+        parts = [
+            (None, "Alice ran down the hill in the morning."),
+            (None, "The rabbit looked at his pocket watch again."),
+        ]
+        got = {0: "সকালে পাহাড়ে দৌড়াল সকালে পাহাড়ে", 1: "খরগোশ আবার ঘড়ি দেখল খরগোশ"}
+        bad = ts.blame(
+            parts,
+            [0, 1],
+            got,
+            ["glossary not followed: Alice -> এলিস"],
+            {"Alice": "এলিস", "rabbit": "খরগোশ"},
+            "en",
+            "bn",
+        )
+        self.assertEqual(bad, {0})
+
+    def _project(self, root, chunks):
+        p = Path(root)
+        (p / "chunks").mkdir()
+        (p / "out").mkdir()
+        for name, text in chunks.items():
+            (p / "chunks" / name).write_text(text, encoding="utf-8")
+        (p / "manifest.json").write_text('{"lang": "bn", "from": "en"}', encoding="utf-8")
+        return p
+
+    def _run(self, project, fake):
+        import argparse
+
+        ns = argparse.Namespace(
+            project=str(project), agents="claude", model=None, jobs=1, retries=2, fallback=False, notify=None
+        )
+        with unittest.mock.patch.object(ts, "call_agent", fake):
+            ts.Runner(ns).go()
+
+    def test_untagged_reply_is_one_call(self):
+        paras = [
+            "Alice ran down the hill in the morning.",
+            "The rabbit looked at his pocket watch again.",
+            "Everyone sat by the river until sunset.",
+        ]
+        with tempfile.TemporaryDirectory() as d:
+            p = self._project(d, {"0001.md": "\n\n".join(paras) + "\n"})
+            seen = []
+
+            def fake(name, model, system, user, timeout=1200):
+                seen.append(user)
+                body = user.split("<passage>\n", 1)[1].rsplit("\n</passage>", 1)[0]
+                return "\n\n".join("অনুবাদ " * len(ts.MARKERS.sub("", part).split()) for part in body.split("\n\n"))
+
+            self._run(p, fake)
+            self.assertEqual(len(seen), 1)
+            out = (p / "out" / "0001.md").read_text(encoding="utf-8")
+            self.assertNotIn("[[", out)
+            self.assertNotIn("Alice", out)
+
+    def test_retry_sends_only_the_failed_paragraph(self):
+        kept = [
+            "Alice ran down the hill in the morning.",
+            "The rabbit looked at his pocket watch again.",
+        ]
+        missed = "Everyone sat by the river until the sun had set."
+        with tempfile.TemporaryDirectory() as d:
+            p = self._project(
+                d,
+                {
+                    "0001.md": "Earlier context paragraph one.\n\nEarlier context paragraph two.\n",
+                    "0002.md": "\n\n".join([*kept, missed]) + "\n",
+                },
+            )
+            (p / "out" / "0001.md").write_text("আগের অনুচ্ছেদ এক।\n\nআগের অনুচ্ছেদ দুই।\n", encoding="utf-8")
+            seen = []
+
+            def fake(name, model, system, user, timeout=1200):
+                seen.append(user)
+                if len(seen) == 1:
+                    return "[[0]] অ্যালিস সকালে পাহাড় বেয়ে দৌড়াল।\n\n[[1]] খরগোশ আবার তার পকেট ঘড়ি দেখল।"
+                mem = (p / "memory.jsonl").read_text(encoding="utf-8")
+                self.assertIn(kept[0], mem)  # saved before this call, so a quota hit would not resend it
+                self.assertNotIn("<context>", user)
+                self.assertNotIn(kept[0], user)
+                return "[[2]] সবাই সূর্যাস্ত পর্যন্ত নদীর ধারে বসে রইল।"
+
+            self._run(p, fake)
+            self.assertEqual(len(seen), 2)
+            self.assertIn("<context>", seen[0])
+            self.assertIn(missed, seen[1])
+            out = (p / "out" / "0002.md").read_text(encoding="utf-8")
+            self.assertNotIn("[[", out)
+            self.assertNotIn("Everyone", out)
+            self.assertIn(missed, (p / "memory.jsonl").read_text(encoding="utf-8"))
+
+    def test_cursor_asks_instead_of_using_tools(self):
+        cmd, stdin = ts.AGENTS["cursor"](None, "SYS", "USER")
+        self.assertEqual(cmd[cmd.index("--mode") + 1], "ask")
+        self.assertEqual(cmd[cmd.index("--workspace") + 1], str(ts.SANDBOX))
+        self.assertNotIn("--force", cmd)
+        self.assertIsNone(stdin)
+        self.assertIn("Do not use tools", cmd[-1])
+        self.assertIn("SYS", cmd[-1])
+        self.assertIn("USER", cmd[-1])
+
+
+class Thinking(unittest.TestCase):
+    def test_gemini_thinking_config(self):
+        self.assertEqual(ts.gemini_thinking("gemini-2.5-flash"), {"thinkingBudget": 0})
+        self.assertEqual(ts.gemini_thinking("gemini-3.5-flash-lite"), {"thinkingLevel": "minimal"})
+        self.assertEqual(ts.gemini_thinking("gemini-3.1-pro"), {"thinkingLevel": "low"})  # Pro has no "minimal"
+
+    def test_openai_drops_refused_reasoning_param(self):
+        srv = HTTPServer(("127.0.0.1", 0), mock_openai.H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        mock_openai.calls = 1  # skip the mock's opening 429
+        base = f"http://127.0.0.1:{srv.server_port}/v1"
+        with unittest.mock.patch.dict(os.environ, {"OPENAI_BASE_URL": base}):
+            text, _, _ = ts.api_openai("plain", "sys", "<passage>\nHello there\n</passage>", 30)
+            self.assertEqual(text, "অনুবাদ অনুবাদ")
+            self.assertEqual(ts._REJECTED[(base, "plain")], {"reasoning_effort"})
+            calls = mock_openai.calls
+            ts.api_openai("plain", "sys", "<passage>\nHi\n</passage>", 30)
+            self.assertEqual(mock_openai.calls, calls + 1)  # remembered: no second 400
+        srv.shutdown()
+
+
+class TranslationMemory(unittest.TestCase):
+    def setUp(self):
+        self.srv = HTTPServer(("127.0.0.1", 0), mock_openai.H)
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+        mock_openai.calls = 1  # skip the mock's opening 429
+        mock_openai.passages.clear()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.d = Path(self.tmp.name)
+        self.env = {**os.environ, "OPENAI_BASE_URL": f"http://127.0.0.1:{self.srv.server_port}/v1"}
+
+    def tearDown(self):
+        self.srv.shutdown()
+        self.tmp.cleanup()
+
+    def cli(self, *a):
+        r = subprocess.run([sys.executable, str(ROOT / "tomeshift.py"), *a], env=self.env, capture_output=True,
+                           text=True, encoding="utf-8", timeout=120)  # fmt: skip
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def prep_and_run(self, book, words):
+        self.cli("prep", str(book), "-p", str(self.d / "p"), "--words", str(words))
+        self.cli("run", "-p", str(self.d / "p"), "--agents", "openai-api", "-j", "2")
+        chunks = list((self.d / "p/chunks").glob("*.md"))
+        self.assertEqual(len(list((self.d / "p/out").glob("*.md"))), len(chunks))
+
+    def test_rechunking_reuses_translations(self):
+        self.prep_and_run(ROOT / "samples/alice.txt", 150)
+        paid = len(mock_openai.passages)
+        self.assertGreater(paid, 1)
+        self.prep_and_run(ROOT / "samples/alice.txt", 100)  # different chunks, same paragraphs
+        self.assertEqual(len(mock_openai.passages), paid)  # nothing sent again
+        # one new paragraph: only that paragraph goes to the model
+        book = self.d / "alice2.txt"
+        extra = "A brand new closing paragraph, added later."
+        book.write_text((ROOT / "samples/alice.txt").read_text(encoding="utf-8") + "\n\n" + extra + "\n", "utf-8")
+        self.prep_and_run(book, 100)
+        self.assertEqual(len(mock_openai.passages), paid + 1)
+        self.assertEqual(ts.MARKERS.sub("", mock_openai.passages[-1]).strip(), extra)
+        self.assertNotIn("[[", ts.book_paragraphs(self.d / "p")[-1][1])  # tags never reach the book
+
+    def test_redo_forgets(self):
+        self.prep_and_run(ROOT / "samples/alice.txt", 150)
+        paid = len(mock_openai.passages)
+        self.cli("redo", "-p", str(self.d / "p"), "1")
+        self.assertFalse((self.d / "p/out/0001.md").exists())
+        self.cli("run", "-p", str(self.d / "p"), "--agents", "openai-api")
+        self.assertEqual(len(mock_openai.passages), paid + 1)
+
+
 class EndToEnd(unittest.TestCase):
     def test_mock_api_run_with_429(self):
-        sys.path.insert(0, str(ROOT / "tests"))
-        import mock_openai
-
+        mock_openai.calls = 0  # the first request gets a 429
         srv = HTTPServer(("127.0.0.1", 0), mock_openai.H)
         threading.Thread(target=srv.serve_forever, daemon=True).start()
         with tempfile.TemporaryDirectory() as d:
@@ -236,6 +422,7 @@ class EndToEnd(unittest.TestCase):
                     env=env,
                     capture_output=True,
                     text=True,
+                    encoding="utf-8",
                     timeout=120,
                 )
 
@@ -286,7 +473,7 @@ class WebUI(unittest.TestCase):
             self.assertTrue(st["job"]["ok"], st["job"])
             self.assertEqual(st["chunks"], 3)
             self.assertEqual(get("/api/projects")[0]["name"], "alice")
-            self.assertIn("Source term", urllib.request.urlopen(base + "/").read().decode())
+            self.assertIn("Source term", urllib.request.urlopen(base + "/").read().decode("utf-8"))
             srv.shutdown()
 
 

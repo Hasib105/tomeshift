@@ -1,10 +1,19 @@
-"""Tiny OpenAI-compatible mock: first request returns 429 (retry-after 3s), then fake Bangla."""
+"""Tiny OpenAI-compatible mock: first request returns 429 (retry-after 3s), then fake Bangla.
+Model "plain" rejects reasoning_effort like a non-reasoning model does."""
 
 import json
+import re
 import sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 calls = 0
+passages: list[str] = []  # every passage it was asked to translate
+
+
+def fake_bangla(paragraph):
+    tag = re.match(r"\[\[\d+\]\] ", paragraph)  # keep segment markers, like a good model
+    words = paragraph[tag.end() if tag else 0 :].split()
+    return (tag.group(0) if tag else "") + " ".join("অনুবাদ" for _ in words)
 
 
 class H(BaseHTTPRequestHandler):
@@ -21,8 +30,14 @@ class H(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(b'{"error":"rate limited"}')
             return
+        if body["model"] == "plain" and "reasoning_effort" in body:
+            self.send_response(400)
+            self.end_headers()
+            self.wfile.write(b'{"error":{"message":"Unsupported parameter: \'reasoning_effort\'"}}')
+            return
         user = body["messages"][-1]["content"].split("<passage>\n", 1)[1].rsplit("\n</passage>", 1)[0]
-        out = "\n\n".join(" ".join("অনুবাদ" for _ in p.split()) for p in user.split("\n\n"))
+        passages.append(user)
+        out = "\n\n".join(fake_bangla(p) for p in user.split("\n\n"))
         resp = {
             "choices": [{"message": {"content": out}, "finish_reason": "stop"}],
             "usage": {"prompt_tokens": len(user) // 4, "completion_tokens": len(out) // 3},

@@ -5,8 +5,8 @@
 # ///
 """tomeshift: translate whole books between any languages with an LLM, as cheaply as possible.
 
-Backends: coding-agent CLIs you already pay for (claude, agy, opencode, codex, gemini, any stdin command)
-or direct APIs (gemini-api, openai-api for any OpenAI-compatible server, anthropic-api).
+Backends: coding-agent CLIs you already pay for (claude, cursor, agy, opencode, codex, gemini, any stdin
+command) or direct APIs (gemini-api, openai-api for any OpenAI-compatible server, anthropic-api).
 
   tomeshift.py prep BOOK.pdf|.epub|.txt|.md -p PROJECT [--from en] [--lang bn]   split + clean
   tomeshift.py glossary -p PROJECT                         one agent call -> glossary.json (edit it!)
@@ -81,13 +81,28 @@ def lang_info(code):
 def rules_for(code, proj=None, source="en"):
     name, _, style = lang_info(code)
     custom = Path(proj, "TRANSLATE.md") if proj else None
-    text = custom.read_text() if custom and custom.exists() else RULES
+    text = custom.read_text(encoding="utf-8") if custom and custom.exists() else RULES
     return text.replace("{language}", name).replace("{style}", style).replace("{source}", lang_info(source)[0])
 
 
 # Empty dir so agents don't load AGENTS.md / CLAUDE.md / project files (saves tokens).
 SANDBOX = Path(tempfile.gettempdir()) / "tomeshift-empty-cwd"
 SANDBOX.mkdir(exist_ok=True)
+
+
+def cursor_argv():
+    """How to start the Cursor CLI. On Windows `agent` is a .cmd shim, and cmd.exe cuts a command
+    line at 8191 characters, which is shorter than a book chunk. The Node entrypoint takes the
+    prompt directly, so the chunk survives."""
+    local = os.environ.get("LOCALAPPDATA")
+    if local:
+        root = Path(local) / "cursor-agent" / "versions"
+        found = [p for p in root.glob("*/index.js") if (p.parent / "node.exe").exists()]
+        if found:
+            latest = max(found, key=lambda p: p.stat().st_mtime)
+            return [str(latest.parent / "node.exe"), str(latest)]
+    return ["agent"]
+
 
 # ---------------------------------------------------------------- agents
 AGENTS = {
@@ -125,15 +140,34 @@ AGENTS = {
         ],
         None,
     ),
+    # stdin carries system+user: `run` reads piped stdin, and a 2,500-word prompt as an argv
+    # argument gets mangled by Windows cmd.exe when launched through the .cmd shim.
     "opencode": lambda model, system, user: (
-        ["opencode", "run", "--pure", "-m", model or "opencode/big-pickle", system + "\n\n" + user],
-        None,
+        ["opencode", "run", "-m", model or "opencode/big-pickle"],
+        system + "\n\n" + user,
     ),
     "codex": lambda model, system, user: (
         ["codex", "exec", "--skip-git-repo-check"] + (["-m", model] if model else []) + ["-"],
         system + "\n\n" + user,
     ),
     "gemini": lambda model, system, user: (["gemini"] + (["-m", model] if model else []) + ["-p", system], user),
+    # Ask mode, empty workspace: a translation must not search the repo or call tools. That is the quota.
+    "cursor": lambda model, system, user: (
+        cursor_argv()
+        + [
+            "-p",
+            "--output-format",
+            "text",
+            "--mode",
+            "ask",
+            "--trust",
+            "--workspace",
+            str(SANDBOX),
+        ]
+        + (["--model", model] if model else [])
+        + ["--", "Do not use tools. Do not read or write files. Do not explain.\n\n" + system + "\n\n" + user],
+        None,
+    ),
     # Anything else: TOMESHIFT_CMD="llm -m gpt-4o-mini" gets the full prompt on stdin, prints the translation.
     "cmd": lambda model, system, user: (os.environ["TOMESHIFT_CMD"].split(), system + "\n\n" + user),
 }
@@ -197,6 +231,14 @@ def _need(var):
     return os.environ[var]
 
 
+def gemini_thinking(model):
+    """Thinking tokens are billed as output. Gemini 2.x turns it off with budget 0; 3.x+ only takes a level
+    (default "high"), and Pro models have no "minimal"."""
+    if re.match(r"gemini-[012]\.", model):
+        return {"thinkingBudget": 0}
+    return {"thinkingLevel": "low" if "pro" in model else "minimal"}
+
+
 def api_gemini(model, system, user, timeout):
     model = model or "gemini-2.5-flash"
     r = _post(
@@ -204,7 +246,11 @@ def api_gemini(model, system, user, timeout):
         {
             "systemInstruction": {"parts": [{"text": system}]},
             "contents": [{"role": "user", "parts": [{"text": user}]}],
-            "generationConfig": {"temperature": 0.3, "maxOutputTokens": 32768, "thinkingConfig": {"thinkingBudget": 0}},
+            "generationConfig": {
+                "temperature": 0.3,
+                "maxOutputTokens": 32768,
+                "thinkingConfig": gemini_thinking(model),
+            },
         },
         {"x-goog-api-key": _need("GEMINI_API_KEY")},
         timeout,
@@ -216,8 +262,11 @@ def api_gemini(model, system, user, timeout):
     return (
         "".join(p.get("text", "") for p in cand.get("content", {}).get("parts", [])),
         u.get("promptTokenCount", 0),
-        u.get("candidatesTokenCount", 0),
+        u.get("candidatesTokenCount", 0) + u.get("thoughtsTokenCount", 0),  # thinking is billed as output
     )
+
+
+_REJECTED: dict[tuple, set] = {}  # (server, model) -> optional params that server refused
 
 
 def api_openai(model, system, user, timeout):
@@ -226,16 +275,24 @@ def api_openai(model, system, user, timeout):
     key = os.environ.get("OPENAI_API_KEY", "none" if "localhost" in base or "127.0.0.1" in base else None) or _need(
         "OPENAI_API_KEY"
     )
-    r = _post(
-        f"{base}/chat/completions",
-        {
-            "model": model or "gpt-4o-mini",
-            "temperature": 0.3,
-            "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
-        },
-        {"Authorization": f"Bearer {key}"},
-        timeout,
-    )
+    model = model or "gpt-4o-mini"
+    body = {
+        "model": model,
+        "temperature": 0.3,
+        # Reasoning models think at "medium" by default, billed as output tokens. Translation doesn't need it.
+        "reasoning_effort": os.environ.get("TOMESHIFT_REASONING", "low"),
+        "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+    }
+    optional = [p for p in ("reasoning_effort", "temperature") if body[p] and p not in _REJECTED.get((base, model), ())]
+    body = {k: v for k, v in body.items() if k in optional or k in ("model", "messages")}
+    try:
+        r = _post(f"{base}/chat/completions", body, {"Authorization": f"Bearer {key}"}, timeout)
+    except RuntimeError as e:  # servers differ on which optional params they accept: drop the refused one
+        refused = [p for p in optional if p in str(e)]
+        if not str(e).startswith("HTTP 400") or not refused:
+            raise
+        _REJECTED.setdefault((base, model), set()).update(refused)
+        return api_openai(model, system, user, timeout)
     ch = r["choices"][0]
     if ch.get("finish_reason") == "length":
         raise RuntimeError("output cut off (length) - use smaller --words")
@@ -274,6 +331,8 @@ def call_agent(name, model, system, user, timeout=1200):
             USAGE["out"] += tout
         return text.strip()
     cmd, stdin = AGENTS[name](model, system, user)
+    # Windows: PATH often holds .cmd/.bat shims (npm-style), which CreateProcess can't find by name.
+    cmd[0] = shutil.which(cmd[0]) or cmd[0]
     try:
         r = subprocess.run(
             cmd,
@@ -287,6 +346,8 @@ def call_agent(name, model, system, user, timeout=1200):
         )
     except subprocess.TimeoutExpired:
         raise RuntimeError("timeout") from None
+    except OSError as e:  # e.g. the CLI was uninstalled mid-run: retry instead of killing the worker
+        raise RuntimeError(f"could not start {cmd[0]}: {e}") from None
     out, err = r.stdout.strip(), r.stderr.strip()
     blob = out[-2000:] + "\n" + err[-2000:]
     # Only treat as a limit when the reply is short (a real translation may mention "quota").
@@ -414,7 +475,8 @@ def cmd_prep(a):
             # keep the original text only for OPF/NCX entries: build() swaps those strings in place
             json.dumps(
                 [{k: v for k, v in sg.items() if k != "text" or sg["kind"] == "xml"} for sg in segs], ensure_ascii=False
-            )
+            ),
+            encoding="utf-8",
         )
         items = [(f"[[{sg['id']}]] {sg['text']}", sg["head"]) for sg in segs]
     else:
@@ -425,7 +487,7 @@ def cmd_prep(a):
             if ext == ".epub"
             else read_docx(src)
             if ext == ".docx"
-            else src.read_text()
+            else src.read_text(encoding="utf-8")
         )
         items = []
         for p in clean(text):
@@ -443,15 +505,29 @@ def cmd_prep(a):
         chunks.append(cur)
     (proj / "chunks").mkdir(parents=True, exist_ok=True)
     (proj / "out").mkdir(exist_ok=True)
-    for old in (proj / "chunks").glob("*.md"):
-        old.unlink()
-    for i, c in enumerate(chunks, 1):
-        (proj / "chunks" / f"{i:04d}.md").write_text("\n\n".join(c) + "\n")
+    old = {c.name: c.read_text(encoding="utf-8") for c in (proj / "chunks").glob("*.md")}
+    # Re-chunking: keep finished translations in the memory, so the next run reuses them instead of paying again.
+    review = proj / "review.txt"
+    flagged = {ln.split(":")[0] for ln in review.read_text(encoding="utf-8").splitlines()} if review.exists() else set()
+    mem, learned = load_memory(proj), []
+    for name, text in old.items():
+        o = proj / "out" / name
+        if o.exists() and name[:-3] not in flagged:
+            learned += [(s, t) for s, t in pairs(text, o.read_text(encoding="utf-8")) if mem.get(s) != t]
+    remember(proj, learned)
+    new = {f"{i:04d}.md": "\n\n".join(c) + "\n" for i, c in enumerate(chunks, 1)}
+    for name in old:
+        (proj / "chunks" / name).unlink()
+    for name, text in new.items():
+        (proj / "chunks" / name).write_text(text, encoding="utf-8")
+    for o in (proj / "out").glob("*.md"):  # a translation only stays if its chunk is unchanged
+        if old.get(o.name) != new.get(o.name):
+            o.unlink()
     total = sum(len(MARKERS.sub(" ", " ".join(c)).split()) for c in chunks)
     src_lang = getattr(a, "from")
     manifest = {"source": str(src.resolve()), "lang": a.lang, "from": src_lang, "chunks": len(chunks), "words": total,
                 "mode": mode}  # fmt: skip
-    (proj / "manifest.json").write_text(json.dumps(manifest, indent=1))
+    (proj / "manifest.json").write_text(json.dumps(manifest, indent=1), encoding="utf-8")
     print(
         f"{len(chunks)} chunks, {total:,} words -> {proj}/chunks/  ({lang_info(src_lang)[0]} -> {lang_info(a.lang)[0]})"
         + ("  [EPUB kept in place]" if mode == "epub" else "")
@@ -461,13 +537,13 @@ def cmd_prep(a):
 def project_lang(proj, key="lang"):
     m = Path(proj) / "manifest.json"
     default = "bn" if key == "lang" else "en"
-    return json.loads(m.read_text()).get(key, default) if m.exists() else default
+    return json.loads(m.read_text(encoding="utf-8")).get(key, default) if m.exists() else default
 
 
 # ---------------------------------------------------------------- glossary
 def cmd_glossary(a):
     proj = Path(a.project)
-    text = MARKERS.sub("", "\n".join(p.read_text() for p in sorted((proj / "chunks").glob("*.md"))))
+    text = MARKERS.sub("", "\n".join(p.read_text(encoding="utf-8") for p in sorted((proj / "chunks").glob("*.md"))))
     src_code = project_lang(proj, "from")
     # Scripts with capital letters: capitalised words/phrases not at sentence start, seen >= 3 times.
     # Other scripts (Bangla, Chinese, Arabic...): let the model pick the terms from a longer excerpt.
@@ -478,7 +554,7 @@ def cmd_glossary(a):
     stop = {"I", "The", "A", "An", "He", "She", "It", "They", "We", "You", "But", "And", "Mr", "Mrs", "Then", "When"}
     terms = [t for t, n in cands.most_common(a.max_terms * 2) if n >= 3 and t not in stop][: a.max_terms]
     gfile = proj / "glossary.json"
-    gloss = json.loads(gfile.read_text()) if gfile.exists() else {}
+    gloss = json.loads(gfile.read_text(encoding="utf-8")) if gfile.exists() else {}
     todo = [t for t in terms if t not in gloss] if cased else None
     if todo == []:
         print("glossary.json already covers all candidates")
@@ -499,7 +575,7 @@ def cmd_glossary(a):
     out = call_agent(a.agents.split(",")[0], a.model, system, user)
     m = re.search(r"\{.*\}", out, re.S)
     gloss.update(json.loads(m.group(0)) if m else {})
-    gfile.write_text(json.dumps(gloss, ensure_ascii=False, indent=1))
+    gfile.write_text(json.dumps(gloss, ensure_ascii=False, indent=1), encoding="utf-8")
     print(f"glossary.json: {len(gloss)} terms. Review and edit it before `run`.")
 
 
@@ -554,11 +630,11 @@ def check(src, out, gloss, src_code, tgt_code):
     src_script = lang_info(src_code)[1] or LATIN
     if tgt_script.pattern != src_script.pattern:  # different scripts: we can tell languages apart
         native, left = len(tgt_script.findall(out)), len(src_script.findall(out))
-        if native < 50:
+        if native < min(50, len(src_script.findall(src)) // 3):  # short passages: a heading, a few lines
             return ["output is not in the target language"]
         if left > 0.15 * (native + left):
             problems.append(f"too much untranslated source text ({left} source-script letters)")
-    if not ({src_code, tgt_code} & DENSE):
+    if len(src) > 200 and not ({src_code, tgt_code} & DENSE):
         ratio = len(out) / max(1, len(src))
         if not 0.55 < ratio < 2.2:
             problems.append(f"length ratio {ratio:.2f} looks wrong (truncated or padded)")
@@ -573,6 +649,139 @@ def check(src, out, gloss, src_code, tgt_code):
     return problems
 
 
+def sent_rows(parts, keys):
+    """Units to send, as (index, [[tag]], source). Plain chunks are numbered; EPUB keeps its segment id."""
+    return [(k, parts[k][0] if parts[k][0] is not None else k, parts[k][1]) for k in keys]
+
+
+def passage_text(rows):
+    return "\n\n".join(f"[[{tag}]] {src}" for _, tag, src in rows)
+
+
+def line_up(sent, out, context=False):
+    """Map unit index -> translation. [[tags]] win, in any order. A reply with none is zipped in order.
+    When this call included <context>, up to two leading paragraphs are dropped: that is the model
+    translating the context. A repair call has no context, so a count mismatch is a real miss."""
+    found = split_segments(out)
+    if found:
+        return {k: found[tag] for k, tag, _ in sent if tag in found and found[tag].strip()}
+    paras = [p.strip() for p in out.strip().split("\n\n") if p.strip()]
+    extra = len(paras) - len(sent)
+    if context and sent and 0 < extra <= 2:
+        paras = paras[extra:]
+    if len(paras) != len(sent):
+        return {}
+    return {sent[i][0]: paras[i] for i in range(len(sent))}
+
+
+def unit_problem(src, tr, src_code, tgt_code):
+    """Why this one paragraph cannot be reused, or '' when it can."""
+    if not tr.strip():
+        return "empty"
+    if "⟦" in src or "⟦" in tr:
+        import tomeshift_epub
+
+        if issue := tomeshift_epub.marker_issue(src, tr):
+            return issue
+    src_script, tgt_script = lang_info(src_code)[1] or LATIN, lang_info(tgt_code)[1] or LATIN
+    src_letters = len(src_script.findall(src))
+    if tgt_script.pattern != src_script.pattern and src_letters >= 15:
+        native, left = len(tgt_script.findall(tr)), len(src_script.findall(tr))
+        if native < max(8, src_letters // 3) and left >= native:
+            return "not in the target language"
+    if len(src) > 200 and not ({src_code, tgt_code} & DENSE):
+        ratio = len(tr) / max(1, len(src))
+        if not 0.55 < ratio < 2.2:
+            return f"length ratio {ratio:.2f}"
+    return ""
+
+
+def blame(parts, keys, got, problems, gloss, src_code, tgt_code):
+    """Which of `keys` a failed check actually complains about. Empty means the check could not be
+    pinned on these paragraphs, so the caller resends all of them."""
+    text = " | ".join(problems)
+    bad = set()
+    for k in keys:
+        src, tr = parts[k][1], got.get(k, "")
+        if not tr:
+            bad.add(k)
+            continue
+        if "marker" in text and ("⟦" in src or "⟦" in tr):
+            import tomeshift_epub
+
+            if tomeshift_epub.marker_issue(src, tr):
+                bad.add(k)
+        if "glossary" in text and any(en in src and trn not in tr for en, trn in gloss.items()):
+            bad.add(k)
+        if ("untranslated" in text or "not in the target language" in text) and unit_problem(
+            src, tr, src_code, tgt_code
+        ):
+            bad.add(k)
+        if "length ratio" in text and unit_problem(src, tr, src_code, tgt_code).startswith("length"):
+            bad.add(k)
+        if "paragraph" in text and src.count("\n\n") != tr.count("\n\n"):
+            bad.add(k)
+    return bad
+
+
+def salvage(parts, keys, got, src_code, tgt_code):
+    """A reply that came back with some [[tags]] missing. Keep the paragraphs that look intact and
+    resend the rest, plus a neighbour that looks like it swallowed the missing one."""
+    missing = [k for k in keys if k not in got]
+    bad = set(missing)
+    for k in keys:
+        if k not in got:
+            continue
+        src, tr = parts[k][1], got[k]
+        swallowed = (
+            missing and len(src) > 80 and not ({src_code, tgt_code} & DENSE) and len(tr) / max(1, len(src)) > 1.8
+        )
+        if unit_problem(src, tr, src_code, tgt_code) or swallowed:
+            bad.add(k)
+    return bad
+
+
+# ---------------------------------------------------------------- translation memory
+# memory.jsonl keeps every accepted paragraph (EPUB: segment) translation, keyed by its source text, so the
+# same text is never paid for twice: not after re-running prep with other settings, nor in a later run.
+def units(text):
+    """Chunk text -> [(segment id or None, source text)]: EPUB segments by [[id]], otherwise paragraphs."""
+    segs = split_segments(text)
+    if segs:
+        return list(segs.items())
+    return [(None, p.strip()) for p in text.split("\n\n") if p.strip()]
+
+
+def pairs(src, out):
+    """[(source unit, translation)], or [] when the output can't be lined up unit by unit."""
+    s, o = units(src), units(out)
+    if s and s[0][0] is not None:
+        tr = dict(o)
+        return [(u, tr[i]) for i, u in s if i in tr]
+    return [(a, b) for (_, a), (_, b) in zip(s, o, strict=True)] if len(s) == len(o) else []
+
+
+def load_memory(proj):
+    mem, f = {}, Path(proj) / "memory.jsonl"
+    for line in f.read_text(encoding="utf-8").splitlines() if f.exists() else []:
+        try:
+            e = json.loads(line)
+        except ValueError:  # a line cut short by a kill
+            continue
+        if e.get("tr"):
+            mem[e["src"]] = e["tr"]
+        else:
+            mem.pop(e["src"], None)
+    return mem
+
+
+def remember(proj, items):
+    """Append [(source, translation)] to the memory; a translation of None forgets that source."""
+    if items:
+        with (Path(proj) / "memory.jsonl").open("a", encoding="utf-8") as f:
+            f.writelines(json.dumps({"src": s, "tr": t}, ensure_ascii=False) + "\n" for s, t in items)
+
+
 # ---------------------------------------------------------------- run
 class Runner:
     def __init__(self, a):
@@ -581,16 +790,19 @@ class Runner:
         self.paused = dict.fromkeys(self.agents)  # agent -> UTC datetime it resumes
         self.lock = threading.Lock()
         self.gloss = (
-            json.loads((self.proj / "glossary.json").read_text()) if (self.proj / "glossary.json").exists() else {}
+            json.loads((self.proj / "glossary.json").read_text(encoding="utf-8"))
+            if (self.proj / "glossary.json").exists()
+            else {}
         )
         self.chunks = sorted((self.proj / "chunks").glob("*.md"))
-        self.words = {c.stem: len(MARKERS.sub(" ", c.read_text()).split()) for c in self.chunks}
+        self.words = {c.stem: len(MARKERS.sub(" ", c.read_text(encoding="utf-8")).split()) for c in self.chunks}
         self.total = sum(self.words.values())
         self.t0, self.done0 = time.time(), self.done_words()
         self.status = "running"
         self.lang = project_lang(self.proj)
         self.src_lang = project_lang(self.proj, "from")
         self.rules = rules_for(self.lang, self.proj, self.src_lang)
+        self.memory = load_memory(self.proj)
 
     def done_words(self):
         return sum(w for s, w in self.words.items() if (self.proj / "out" / f"{s}.md").exists())
@@ -624,7 +836,8 @@ class Runner:
                     "tokens_out": USAGE["out"],
                     "updated": datetime.now().isoformat(timespec="seconds"),
                 }
-            )
+            ),
+            encoding="utf-8",
         )
 
     def pick_agent(self):
@@ -645,23 +858,71 @@ class Runner:
     def context_for(self, idx):
         if idx == 0:
             return ""
-        prev = self.chunks[idx - 1].read_text().strip().split("\n\n")[-2:]
+        prev = self.chunks[idx - 1].read_text(encoding="utf-8").strip().split("\n\n")[-2:]
         return "<context>\n" + MARKERS.sub("", "\n\n".join(prev)).strip() + "\n</context>\n\n"
+
+    def chunk_problems(self, full, parts, chosen, epub):
+        out = self.assemble(parts, chosen, {}, epub)
+        src = full if epub else "\n\n".join(u for _, u in parts) + "\n"
+        gloss = {k: v for k, v in self.gloss.items() if k in src}
+        return out, check(src, out, gloss, self.src_lang, self.lang)
+
+    def remember_ok(self, parts, good):
+        """Write clean paragraphs to memory now. A CLI can hit its quota on the next call; these stay done."""
+        learned = [(parts[k][1], tr) for k, tr in good.items() if tr and self.memory.get(parts[k][1]) != tr]
+        if learned:
+            with self.lock:
+                self.memory.update(dict(learned))
+                remember(self.proj, learned)
+
+    def accept(self, dest, full, parts, chosen, epub, stem, agent, from_memory):
+        out, problems = self.chunk_problems(full, parts, chosen, epub)
+        if problems:
+            blamed = blame(parts, list(chosen), chosen, problems, self.gloss, self.src_lang, self.lang)
+            clean = {
+                k: tr
+                for k, tr in chosen.items()
+                if k not in blamed and not unit_problem(parts[k][1], tr, self.src_lang, self.lang)
+            }
+        else:
+            clean = chosen
+        dest.write_text(out, encoding="utf-8")
+        self.remember_ok(parts, clean)
+        if from_memory:
+            self.log(stem, agent, f"{from_memory} of {len(parts)} paragraphs from translation memory")
+        if problems:
+            self.log(stem, agent, "accepted with problems: " + " | ".join(problems))
+            with (self.proj / "review.txt").open("a", encoding="utf-8") as f:
+                f.write(f"{stem}: {' | '.join(problems)}\n")
 
     def translate(self, idx):
         chunk = self.chunks[idx]
         dest = self.proj / "out" / f"{chunk.stem}.md"
         if dest.exists():
             return
-        src = chunk.read_text()
-        terms = {k: v for k, v in self.gloss.items() if k in src}  # only terms this chunk uses
-        system = self.rules + (
-            "\n\nGlossary (use exactly):\n" + "\n".join(f"{k} = {v}" for k, v in terms.items()) if terms else ""
-        )
-        feedback, backoff = "", 600
+        full = chunk.read_text(encoding="utf-8")
+        parts = units(full)
+        epub = bool(parts) and parts[0][0] is not None
+        known = {k: self.memory[u] for k, (_, u) in enumerate(parts) if u in self.memory}
+        if parts and len(known) == len(parts):
+            self.save(dest, full, self.assemble(parts, known, {}, epub), [])
+            self.log(chunk.stem, "memory", "all from translation memory")
+            return
+        pending = [k for k in range(len(parts)) if k not in known]
+        reused, feedback, backoff = len(known), "", 600
         for attempt in range(self.a.retries + 1):
+            # Tags let a partial reply be saved. Context goes out only with a whole chunk: a repair is a
+            # few paragraphs, and the previous chunk's context makes a CLI translate it and spend another call.
+            rows = sent_rows(parts, pending)
+            src = passage_text(rows)
+            terms = {k: v for k, v in self.gloss.items() if k in src}
+            system = self.rules + (
+                "\n\nGlossary (use exactly):\n" + "\n".join(f"{k} = {v}" for k, v in terms.items()) if terms else ""
+            )
+            whole = pending == list(range(len(parts)))
+            context = self.context_for(idx) if whole and not feedback else ""
             agent = self.pick_agent()
-            user = self.context_for(idx) + feedback + "<passage>\n" + src.strip() + "\n</passage>"
+            user = context + feedback + "<passage>\n" + src + "\n</passage>"
             try:
                 out = tidy(call_agent(agent, self.a.model if agent == self.agents[0] else None, system, user))
             except LimitHit as e:
@@ -672,25 +933,57 @@ class Runner:
                     if not self.paused[agent]:
                         self.notify(f"{agent} hit its limit; paused until {until.astimezone():%H:%M}")
                     self.paused[agent] = until
-                return self.translate(idx)  # limit doesn't use up a retry
+                return self.translate(idx)  # limit doesn't use up a retry; memory already holds the good paragraphs
             except RuntimeError as e:
                 feedback = ""
                 self.log(chunk.stem, agent, f"error: {e}")
                 time.sleep(10)
                 continue
-            problems = check(src, out, terms, self.src_lang, self.lang)
-            if not problems or attempt == self.a.retries:
-                dest.write_text(out)
-                if problems:
-                    self.log(chunk.stem, agent, "accepted with problems: " + " | ".join(problems))
-                    with (self.proj / "review.txt").open("a") as f:
-                        f.write(f"{chunk.stem}: {' | '.join(problems)}\n")
+            got = line_up(rows, out, bool(context))
+            if len(got) == len(rows):
+                _, problems = self.chunk_problems(full, parts, {**known, **got}, epub)
+                bad = blame(parts, pending, got, problems, self.gloss, self.src_lang, self.lang) or set(pending)
+                if not problems:
+                    bad = set()
+            else:
+                bad = salvage(parts, pending, got, self.src_lang, self.lang)
+                problems = [f"{len(bad)} of {len(rows)} paragraphs did not line up"]
+            if not bad or attempt == self.a.retries:
+                self.accept(dest, full, parts, {**known, **got}, epub, chunk.stem, agent, reused)
                 return
+            good = {k: got[k] for k in pending if k not in bad and k in got}
+            if good and set(bad) != set(pending):
+                self.remember_ok(parts, good)
+                known.update(good)
+                self.log(chunk.stem, agent, f"kept {len(good)} paragraphs, retrying {len(bad)}")
             self.log(chunk.stem, agent, "retry: " + " | ".join(problems))
+            pending = [k for k in pending if k in bad]
             feedback = "Your previous attempt had these problems, fix them: " + "; ".join(problems) + "\n\n"
 
+    @staticmethod
+    def assemble(parts, known, new, epub):
+        """Chunk output in source order from memory hits + the model's [[k]]-tagged reply. A unit the model
+        dropped stays out in EPUB mode (build keeps the original there) and stays in the source language otherwise."""
+        rows = []
+        for k, (i, u) in enumerate(parts):
+            tr = known.get(k) or new.get(i if epub else k)
+            if epub and tr:
+                rows.append(f"[[{i}]] {tr}")
+            elif not epub:
+                rows.append(tr or u)
+        return "\n\n".join(rows) + "\n"
+
+    def save(self, dest, src, out, problems):
+        dest.write_text(out, encoding="utf-8")
+        if problems:  # only clean translations are worth reusing
+            return
+        learned = [(s, t) for s, t in pairs(src, out) if self.memory.get(s) != t]
+        with self.lock:
+            self.memory.update(learned)
+            remember(self.proj, learned)
+
     def log(self, stem, agent, msg):
-        with self.lock, (self.proj / "run.log").open("a") as f:
+        with self.lock, (self.proj / "run.log").open("a", encoding="utf-8") as f:
             f.write(f"{datetime.now():%Y-%m-%d %H:%M:%S} {stem} [{agent}] {msg}\n")
 
     def go(self):
@@ -710,7 +1003,7 @@ class Runner:
         review = self.proj / "review.txt"
         self.notify(
             f"finished: {self.done_words():,} words. Problems to review: "
-            f"{len(review.read_text().splitlines()) if review.exists() else 0}"
+            f"{len(review.read_text(encoding='utf-8').splitlines()) if review.exists() else 0}"
         )
 
 
@@ -727,35 +1020,45 @@ def cmd_run(a):
     Runner(a).go()
 
 
+def cmd_redo(a):
+    """Throw away chunk translations, memory included, so the next run translates them fresh."""
+    proj = Path(a.project)
+    for n in a.chunks:
+        chunk = proj / "chunks" / f"{int(n):04d}.md"
+        if chunk.exists():
+            remember(proj, [(u, None) for _, u in units(chunk.read_text(encoding="utf-8"))])
+        (proj / "out" / chunk.name).unlink(missing_ok=True)
+
+
 def cmd_status(a):
     p = Path(a.project) / "progress.json"
-    print(p.read_text() if p.exists() else "not started")
+    print(p.read_text(encoding="utf-8") if p.exists() else "not started")
 
 
 # ---------------------------------------------------------------- build
 def book_paragraphs(proj):
     """[(source, translation or None, is_heading)] in reading order, as plain text (markers removed)."""
-    man = json.loads((proj / "manifest.json").read_text())
+    man = json.loads((proj / "manifest.json").read_text(encoding="utf-8"))
     rows = []
     if man.get("mode") == "epub":
         import tomeshift_epub
 
-        segs = json.loads((proj / "segments.json").read_text())
+        segs = json.loads((proj / "segments.json").read_text(encoding="utf-8"))
         src, out = {}, {}
         for c in sorted((proj / "chunks").glob("*.md")):
-            src.update(split_segments(c.read_text()))
+            src.update(split_segments(c.read_text(encoding="utf-8")))
             o = proj / "out" / c.name
             if o.exists():
-                out.update(split_segments(o.read_text()))
+                out.update(split_segments(o.read_text(encoding="utf-8")))
         for sg in segs:
             if sg["kind"] == "xhtml":
                 tr = out.get(sg["id"])
                 rows.append((tomeshift_epub.plain(src.get(sg["id"], "")), tr and tomeshift_epub.plain(tr), sg["head"]))
         return rows
     for c in sorted((proj / "chunks").glob("*.md")):
-        sp = [p.strip() for p in c.read_text().split("\n\n") if p.strip()]
+        sp = [p.strip() for p in c.read_text(encoding="utf-8").split("\n\n") if p.strip()]
         o = proj / "out" / c.name
-        op = [p.strip() for p in o.read_text().split("\n\n") if p.strip()] if o.exists() else []
+        op = [p.strip() for p in o.read_text(encoding="utf-8").split("\n\n") if p.strip()] if o.exists() else []
         if len(sp) == len(op):
             rows += [(a, b, a.startswith("# ")) for a, b in zip(sp, op, strict=True)]
         else:  # can't pair paragraph by paragraph: keep the chunk together
@@ -781,23 +1084,23 @@ def render_markdown(rows, layout):
 
 def cmd_build(a):
     proj = Path(a.project)
-    man = json.loads((proj / "manifest.json").read_text())
+    man = json.loads((proj / "manifest.json").read_text(encoding="utf-8"))
     lang, layout = man.get("lang", "bn"), getattr(a, "layout", "replace")
     suffix = "" if layout == "replace" else "_bilingual"
     missing = len(list((proj / "chunks").glob("*.md"))) - len(list((proj / "out").glob("*.md")))
     rows = book_paragraphs(proj)
     md = render_markdown(rows, layout)
-    (proj / f"book_{lang}{suffix}.md").write_text(md)
+    (proj / f"book_{lang}{suffix}.md").write_text(md, encoding="utf-8")
     title = a.title or proj.name
     write_docx(md, proj / f"book_{lang}{suffix}.docx", lang, title)
     epub = proj / f"book_{lang}{suffix}.epub"
     if man.get("mode") == "epub":
         import tomeshift_epub
 
-        segs = json.loads((proj / "segments.json").read_text())
+        segs = json.loads((proj / "segments.json").read_text(encoding="utf-8"))
         translations = {}
         for o in sorted((proj / "out").glob("*.md")):
-            translations.update(split_segments(o.read_text()))
+            translations.update(split_segments(o.read_text(encoding="utf-8")))
         st = tomeshift_epub.build(proj / "source.epub", segs, translations, epub, lang, layout)
         detail = f"original layout kept; {st['translated']} segments translated"
         if st["fallback"]:
@@ -983,6 +1286,9 @@ def write_docx(md, path, lang, title):
 
 # ---------------------------------------------------------------- cli
 def main():
+    for stream in (sys.stdout, sys.stderr):  # Windows consoles default to cp1252: the progress bar and Bangla crash it
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("prep")
@@ -1013,6 +1319,9 @@ def main():
             s.add_argument("--title")
             s.add_argument("--layout", choices=["replace", "bilingual"], default="replace",
                            help="replace the text, or keep each original paragraph followed by its translation")  # fmt: skip
+    s = sub.add_parser("redo", help="forget chunk translations (and their memory) so the next run redoes them")
+    s.add_argument("-p", "--project", required=True)
+    s.add_argument("chunks", nargs="+", help="chunk numbers, e.g. 3 17")
     s = sub.add_parser("ui", help="open the local web UI")
     s.add_argument("--dir", default="tomeshift-projects", help="folder for books (default ./tomeshift-projects)")
     s.add_argument("--host", default="127.0.0.1")
@@ -1025,6 +1334,7 @@ def main():
         "run": cmd_run,
         "status": cmd_status,
         "build": cmd_build,
+        "redo": cmd_redo,
         "ui": cmd_ui,
     }[a.cmd](a)
 
