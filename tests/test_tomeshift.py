@@ -86,9 +86,9 @@ class TextPrep(unittest.TestCase):
             )
             chunks = sorted(Path(d, "chunks").glob("*.md"))
             self.assertEqual(len(chunks), 3)
-            self.assertTrue(chunks[2].read_text().startswith("# CHAPTER II"))
+            self.assertTrue(chunks[2].read_text(encoding="utf-8").startswith("# CHAPTER II"))
             for c in chunks:  # pretend-translate: copy the source
-                Path(d, "out", c.name).write_text(c.read_text())
+                Path(d, "out", c.name).write_text(c.read_text(encoding="utf-8"), encoding="utf-8")
             ts.cmd_build(argparse.Namespace(project=d, title="Alice"))
             epub = Path(d, "book_bn.epub")
             with zipfile.ZipFile(epub) as z:
@@ -105,7 +105,9 @@ def fake_translate(project):
     import re
 
     for c in Path(project, "chunks").glob("*.md"):
-        Path(project, "out", c.name).write_text(re.sub(r"[A-Za-z]+", "অনুবাদ", c.read_text()))
+        Path(project, "out", c.name).write_text(
+            re.sub(r"[A-Za-z]+", "অনুবাদ", c.read_text(encoding="utf-8")), encoding="utf-8"
+        )
 
 
 class EpubInPlace(unittest.TestCase):
@@ -135,7 +137,7 @@ class EpubInPlace(unittest.TestCase):
             return z.read(member)
 
     def test_segments_and_markers(self):
-        chunk = (self.d / "p/chunks/0001.md").read_text()
+        chunk = (self.d / "p/chunks/0001.md").read_text(encoding="utf-8")
         self.assertIn("[[2]] Alice was beginning to get ⟦1⟧very⟦/1⟧ tired", chunk)
         self.assertIn("The White Rabbit with a watch", chunk)  # img alt
         self.assertIn("Loose words in a box.", chunk)  # text next to block elements
@@ -156,7 +158,7 @@ class EpubInPlace(unittest.TestCase):
             for n in z.namelist():
                 if n.endswith((".xhtml", ".opf", ".ncx")):
                     xml.dom.minidom.parseString(z.read(n))  # still well-formed
-        ch = self.read("book_bn.epub", "OEBPS/text/ch1.xhtml").decode()
+        ch = self.read("book_bn.epub", "OEBPS/text/ch1.xhtml").decode("utf-8")
         self.assertTrue(ch.startswith('<?xml version="1.0" encoding="utf-8"?>\n<!DOCTYPE html>'))
         self.assertIn('lang="bn"', ch)
         self.assertIn("<strong>অনুবাদ <em>অনুবাদ</em></strong>", ch)
@@ -164,29 +166,31 @@ class EpubInPlace(unittest.TestCase):
         self.assertIn('print("do not translate me")', ch)
         self.assertIn('alt="অনুবাদ', ch)
         self.assertNotIn("Alice", ch)
-        opf = self.read("book_bn.epub", "OEBPS/content.opf").decode()
+        opf = self.read("book_bn.epub", "OEBPS/content.opf").decode("utf-8")
         self.assertIn("<dc:language>bn</dc:language>", opf)
         self.assertNotIn("Alice in Wonderland", opf)
-        self.assertNotIn("Rabbit-Hole", self.read("book_bn.epub", "OEBPS/toc.ncx").decode())
-        self.assertNotIn("Rabbit-Hole", self.read("book_bn.epub", "OEBPS/nav.xhtml").decode())
+        self.assertNotIn("Rabbit-Hole", self.read("book_bn.epub", "OEBPS/toc.ncx").decode("utf-8"))
+        self.assertNotIn("Rabbit-Hole", self.read("book_bn.epub", "OEBPS/nav.xhtml").decode("utf-8"))
 
     def test_bilingual_layout(self):
         import re
 
         self.build("bilingual")
-        ch = self.read("book_bn_bilingual.epub", "OEBPS/text/ch1.xhtml").decode()
+        ch = self.read("book_bn_bilingual.epub", "OEBPS/text/ch1.xhtml").decode("utf-8")
         self.assertIn("Alice was", ch)  # original kept
         self.assertIn('<p class="first" lang="bn" xml:lang="bn">অনুবাদ', ch)  # translation right after it
         ids = re.findall(r' id="([^"]+)"', ch)
         self.assertEqual(len(ids), len(set(ids)), "duplicate ids")
-        md = (self.d / "p/book_bn_bilingual.md").read_text()
+        md = (self.d / "p/book_bn_bilingual.md").read_text(encoding="utf-8")
         self.assertLess(md.index("Alice was"), md.index("অনুবাদ অনুবাদ অনুবাদ অনুবাদ অনুবাদ"))
 
     def test_broken_markers_fall_back_safely(self):
         out = self.d / "p/out/0001.md"
-        out.write_text(out.read_text().replace("⟦/1⟧", "", 1))  # model dropped a closing marker
+        out.write_text(
+            out.read_text(encoding="utf-8").replace("⟦/1⟧", "", 1), encoding="utf-8"
+        )  # model dropped a closing marker
         self.build("replace")
-        ch = self.read("book_bn.epub", "OEBPS/text/ch1.xhtml").decode()
+        ch = self.read("book_bn.epub", "OEBPS/text/ch1.xhtml").decode("utf-8")
         self.assertIn('<a href="#n1" id="r1"', ch)  # the footnote link survives the fallback
         self.assertNotIn("⟦", ch)
 
@@ -236,6 +240,7 @@ class EndToEnd(unittest.TestCase):
                     env=env,
                     capture_output=True,
                     text=True,
+                    encoding="utf-8",
                     timeout=120,
                 )
 
@@ -286,7 +291,7 @@ class WebUI(unittest.TestCase):
             self.assertTrue(st["job"]["ok"], st["job"])
             self.assertEqual(st["chunks"], 3)
             self.assertEqual(get("/api/projects")[0]["name"], "alice")
-            self.assertIn("Source term", urllib.request.urlopen(base + "/").read().decode())
+            self.assertIn("Source term", urllib.request.urlopen(base + "/").read().decode("utf-8"))
             srv.shutdown()
 
 

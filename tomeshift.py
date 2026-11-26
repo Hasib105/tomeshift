@@ -81,7 +81,7 @@ def lang_info(code):
 def rules_for(code, proj=None, source="en"):
     name, _, style = lang_info(code)
     custom = Path(proj, "TRANSLATE.md") if proj else None
-    text = custom.read_text() if custom and custom.exists() else RULES
+    text = custom.read_text(encoding="utf-8") if custom and custom.exists() else RULES
     return text.replace("{language}", name).replace("{style}", style).replace("{source}", lang_info(source)[0])
 
 
@@ -125,9 +125,11 @@ AGENTS = {
         ],
         None,
     ),
+    # stdin carries system+user: `run` reads piped stdin, and a 2,500-word prompt as an argv
+    # argument gets mangled by Windows cmd.exe when launched through the .cmd shim.
     "opencode": lambda model, system, user: (
-        ["opencode", "run", "--pure", "-m", model or "opencode/big-pickle", system + "\n\n" + user],
-        None,
+        ["opencode", "run", "-m", model or "opencode/big-pickle"],
+        system + "\n\n" + user,
     ),
     "codex": lambda model, system, user: (
         ["codex", "exec", "--skip-git-repo-check"] + (["-m", model] if model else []) + ["-"],
@@ -274,6 +276,8 @@ def call_agent(name, model, system, user, timeout=1200):
             USAGE["out"] += tout
         return text.strip()
     cmd, stdin = AGENTS[name](model, system, user)
+    # Windows: PATH often holds .cmd/.bat shims (npm-style), which CreateProcess can't find by name.
+    cmd[0] = shutil.which(cmd[0]) or cmd[0]
     try:
         r = subprocess.run(
             cmd,
@@ -287,6 +291,8 @@ def call_agent(name, model, system, user, timeout=1200):
         )
     except subprocess.TimeoutExpired:
         raise RuntimeError("timeout") from None
+    except OSError as e:  # e.g. the CLI was uninstalled mid-run: retry instead of killing the worker
+        raise RuntimeError(f"could not start {cmd[0]}: {e}") from None
     out, err = r.stdout.strip(), r.stderr.strip()
     blob = out[-2000:] + "\n" + err[-2000:]
     # Only treat as a limit when the reply is short (a real translation may mention "quota").
@@ -414,7 +420,8 @@ def cmd_prep(a):
             # keep the original text only for OPF/NCX entries: build() swaps those strings in place
             json.dumps(
                 [{k: v for k, v in sg.items() if k != "text" or sg["kind"] == "xml"} for sg in segs], ensure_ascii=False
-            )
+            ),
+            encoding="utf-8",
         )
         items = [(f"[[{sg['id']}]] {sg['text']}", sg["head"]) for sg in segs]
     else:
@@ -425,7 +432,7 @@ def cmd_prep(a):
             if ext == ".epub"
             else read_docx(src)
             if ext == ".docx"
-            else src.read_text()
+            else src.read_text(encoding="utf-8")
         )
         items = []
         for p in clean(text):
@@ -446,12 +453,12 @@ def cmd_prep(a):
     for old in (proj / "chunks").glob("*.md"):
         old.unlink()
     for i, c in enumerate(chunks, 1):
-        (proj / "chunks" / f"{i:04d}.md").write_text("\n\n".join(c) + "\n")
+        (proj / "chunks" / f"{i:04d}.md").write_text("\n\n".join(c) + "\n", encoding="utf-8")
     total = sum(len(MARKERS.sub(" ", " ".join(c)).split()) for c in chunks)
     src_lang = getattr(a, "from")
     manifest = {"source": str(src.resolve()), "lang": a.lang, "from": src_lang, "chunks": len(chunks), "words": total,
                 "mode": mode}  # fmt: skip
-    (proj / "manifest.json").write_text(json.dumps(manifest, indent=1))
+    (proj / "manifest.json").write_text(json.dumps(manifest, indent=1), encoding="utf-8")
     print(
         f"{len(chunks)} chunks, {total:,} words -> {proj}/chunks/  ({lang_info(src_lang)[0]} -> {lang_info(a.lang)[0]})"
         + ("  [EPUB kept in place]" if mode == "epub" else "")
@@ -461,13 +468,13 @@ def cmd_prep(a):
 def project_lang(proj, key="lang"):
     m = Path(proj) / "manifest.json"
     default = "bn" if key == "lang" else "en"
-    return json.loads(m.read_text()).get(key, default) if m.exists() else default
+    return json.loads(m.read_text(encoding="utf-8")).get(key, default) if m.exists() else default
 
 
 # ---------------------------------------------------------------- glossary
 def cmd_glossary(a):
     proj = Path(a.project)
-    text = MARKERS.sub("", "\n".join(p.read_text() for p in sorted((proj / "chunks").glob("*.md"))))
+    text = MARKERS.sub("", "\n".join(p.read_text(encoding="utf-8") for p in sorted((proj / "chunks").glob("*.md"))))
     src_code = project_lang(proj, "from")
     # Scripts with capital letters: capitalised words/phrases not at sentence start, seen >= 3 times.
     # Other scripts (Bangla, Chinese, Arabic...): let the model pick the terms from a longer excerpt.
@@ -478,7 +485,7 @@ def cmd_glossary(a):
     stop = {"I", "The", "A", "An", "He", "She", "It", "They", "We", "You", "But", "And", "Mr", "Mrs", "Then", "When"}
     terms = [t for t, n in cands.most_common(a.max_terms * 2) if n >= 3 and t not in stop][: a.max_terms]
     gfile = proj / "glossary.json"
-    gloss = json.loads(gfile.read_text()) if gfile.exists() else {}
+    gloss = json.loads(gfile.read_text(encoding="utf-8")) if gfile.exists() else {}
     todo = [t for t in terms if t not in gloss] if cased else None
     if todo == []:
         print("glossary.json already covers all candidates")
@@ -499,7 +506,7 @@ def cmd_glossary(a):
     out = call_agent(a.agents.split(",")[0], a.model, system, user)
     m = re.search(r"\{.*\}", out, re.S)
     gloss.update(json.loads(m.group(0)) if m else {})
-    gfile.write_text(json.dumps(gloss, ensure_ascii=False, indent=1))
+    gfile.write_text(json.dumps(gloss, ensure_ascii=False, indent=1), encoding="utf-8")
     print(f"glossary.json: {len(gloss)} terms. Review and edit it before `run`.")
 
 
@@ -581,10 +588,12 @@ class Runner:
         self.paused = dict.fromkeys(self.agents)  # agent -> UTC datetime it resumes
         self.lock = threading.Lock()
         self.gloss = (
-            json.loads((self.proj / "glossary.json").read_text()) if (self.proj / "glossary.json").exists() else {}
+            json.loads((self.proj / "glossary.json").read_text(encoding="utf-8"))
+            if (self.proj / "glossary.json").exists()
+            else {}
         )
         self.chunks = sorted((self.proj / "chunks").glob("*.md"))
-        self.words = {c.stem: len(MARKERS.sub(" ", c.read_text()).split()) for c in self.chunks}
+        self.words = {c.stem: len(MARKERS.sub(" ", c.read_text(encoding="utf-8")).split()) for c in self.chunks}
         self.total = sum(self.words.values())
         self.t0, self.done0 = time.time(), self.done_words()
         self.status = "running"
@@ -624,7 +633,8 @@ class Runner:
                     "tokens_out": USAGE["out"],
                     "updated": datetime.now().isoformat(timespec="seconds"),
                 }
-            )
+            ),
+            encoding="utf-8",
         )
 
     def pick_agent(self):
@@ -645,7 +655,7 @@ class Runner:
     def context_for(self, idx):
         if idx == 0:
             return ""
-        prev = self.chunks[idx - 1].read_text().strip().split("\n\n")[-2:]
+        prev = self.chunks[idx - 1].read_text(encoding="utf-8").strip().split("\n\n")[-2:]
         return "<context>\n" + MARKERS.sub("", "\n\n".join(prev)).strip() + "\n</context>\n\n"
 
     def translate(self, idx):
@@ -653,7 +663,7 @@ class Runner:
         dest = self.proj / "out" / f"{chunk.stem}.md"
         if dest.exists():
             return
-        src = chunk.read_text()
+        src = chunk.read_text(encoding="utf-8")
         terms = {k: v for k, v in self.gloss.items() if k in src}  # only terms this chunk uses
         system = self.rules + (
             "\n\nGlossary (use exactly):\n" + "\n".join(f"{k} = {v}" for k, v in terms.items()) if terms else ""
@@ -680,17 +690,17 @@ class Runner:
                 continue
             problems = check(src, out, terms, self.src_lang, self.lang)
             if not problems or attempt == self.a.retries:
-                dest.write_text(out)
+                dest.write_text(out, encoding="utf-8")
                 if problems:
                     self.log(chunk.stem, agent, "accepted with problems: " + " | ".join(problems))
-                    with (self.proj / "review.txt").open("a") as f:
+                    with (self.proj / "review.txt").open("a", encoding="utf-8") as f:
                         f.write(f"{chunk.stem}: {' | '.join(problems)}\n")
                 return
             self.log(chunk.stem, agent, "retry: " + " | ".join(problems))
             feedback = "Your previous attempt had these problems, fix them: " + "; ".join(problems) + "\n\n"
 
     def log(self, stem, agent, msg):
-        with self.lock, (self.proj / "run.log").open("a") as f:
+        with self.lock, (self.proj / "run.log").open("a", encoding="utf-8") as f:
             f.write(f"{datetime.now():%Y-%m-%d %H:%M:%S} {stem} [{agent}] {msg}\n")
 
     def go(self):
@@ -710,7 +720,7 @@ class Runner:
         review = self.proj / "review.txt"
         self.notify(
             f"finished: {self.done_words():,} words. Problems to review: "
-            f"{len(review.read_text().splitlines()) if review.exists() else 0}"
+            f"{len(review.read_text(encoding='utf-8').splitlines()) if review.exists() else 0}"
         )
 
 
@@ -729,33 +739,33 @@ def cmd_run(a):
 
 def cmd_status(a):
     p = Path(a.project) / "progress.json"
-    print(p.read_text() if p.exists() else "not started")
+    print(p.read_text(encoding="utf-8") if p.exists() else "not started")
 
 
 # ---------------------------------------------------------------- build
 def book_paragraphs(proj):
     """[(source, translation or None, is_heading)] in reading order, as plain text (markers removed)."""
-    man = json.loads((proj / "manifest.json").read_text())
+    man = json.loads((proj / "manifest.json").read_text(encoding="utf-8"))
     rows = []
     if man.get("mode") == "epub":
         import tomeshift_epub
 
-        segs = json.loads((proj / "segments.json").read_text())
+        segs = json.loads((proj / "segments.json").read_text(encoding="utf-8"))
         src, out = {}, {}
         for c in sorted((proj / "chunks").glob("*.md")):
-            src.update(split_segments(c.read_text()))
+            src.update(split_segments(c.read_text(encoding="utf-8")))
             o = proj / "out" / c.name
             if o.exists():
-                out.update(split_segments(o.read_text()))
+                out.update(split_segments(o.read_text(encoding="utf-8")))
         for sg in segs:
             if sg["kind"] == "xhtml":
                 tr = out.get(sg["id"])
                 rows.append((tomeshift_epub.plain(src.get(sg["id"], "")), tr and tomeshift_epub.plain(tr), sg["head"]))
         return rows
     for c in sorted((proj / "chunks").glob("*.md")):
-        sp = [p.strip() for p in c.read_text().split("\n\n") if p.strip()]
+        sp = [p.strip() for p in c.read_text(encoding="utf-8").split("\n\n") if p.strip()]
         o = proj / "out" / c.name
-        op = [p.strip() for p in o.read_text().split("\n\n") if p.strip()] if o.exists() else []
+        op = [p.strip() for p in o.read_text(encoding="utf-8").split("\n\n") if p.strip()] if o.exists() else []
         if len(sp) == len(op):
             rows += [(a, b, a.startswith("# ")) for a, b in zip(sp, op, strict=True)]
         else:  # can't pair paragraph by paragraph: keep the chunk together
@@ -781,23 +791,23 @@ def render_markdown(rows, layout):
 
 def cmd_build(a):
     proj = Path(a.project)
-    man = json.loads((proj / "manifest.json").read_text())
+    man = json.loads((proj / "manifest.json").read_text(encoding="utf-8"))
     lang, layout = man.get("lang", "bn"), getattr(a, "layout", "replace")
     suffix = "" if layout == "replace" else "_bilingual"
     missing = len(list((proj / "chunks").glob("*.md"))) - len(list((proj / "out").glob("*.md")))
     rows = book_paragraphs(proj)
     md = render_markdown(rows, layout)
-    (proj / f"book_{lang}{suffix}.md").write_text(md)
+    (proj / f"book_{lang}{suffix}.md").write_text(md, encoding="utf-8")
     title = a.title or proj.name
     write_docx(md, proj / f"book_{lang}{suffix}.docx", lang, title)
     epub = proj / f"book_{lang}{suffix}.epub"
     if man.get("mode") == "epub":
         import tomeshift_epub
 
-        segs = json.loads((proj / "segments.json").read_text())
+        segs = json.loads((proj / "segments.json").read_text(encoding="utf-8"))
         translations = {}
         for o in sorted((proj / "out").glob("*.md")):
-            translations.update(split_segments(o.read_text()))
+            translations.update(split_segments(o.read_text(encoding="utf-8")))
         st = tomeshift_epub.build(proj / "source.epub", segs, translations, epub, lang, layout)
         detail = f"original layout kept; {st['translated']} segments translated"
         if st["fallback"]:
@@ -983,6 +993,9 @@ def write_docx(md, path, lang, title):
 
 # ---------------------------------------------------------------- cli
 def main():
+    for stream in (sys.stdout, sys.stderr):  # Windows consoles default to cp1252: the progress bar and Bangla crash it
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("prep")
