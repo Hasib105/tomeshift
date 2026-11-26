@@ -3,7 +3,7 @@ name: tomeshift
 description: >
   Translate a whole book or long document (PDF, EPUB, DOCX, TXT, Markdown) into another language at the
   lowest possible cost with the tomeshift CLI. It chunks and cleans the text, builds a glossary for
-  consistent names, translates through a coding-agent CLI (claude, codex, gemini, opencode, agy) or an
+  consistent names, translates through a coding-agent CLI (claude, cursor, codex, gemini, opencode, agy) or an
   API (Gemini, any OpenAI-compatible, Anthropic), pauses on usage limits, resumes by itself, and
   outputs EPUB (original layout kept), DOCX and Markdown, optionally bilingual. Use when the user wants to translate a book, novel, manual, thesis or any
   text too long for one reply, or asks to estimate or reduce the cost of such a translation.
@@ -31,7 +31,7 @@ Below, `tomeshift` means whichever form worked.
 
 - **File**: path to the .pdf / .epub / .docx / .txt / .md. EPUBs are translated in place (layout, images, footnotes kept). A scanned PDF needs OCR first (`ocrmypdf in.pdf out.pdf`).
 - **Languages**: `--from` (default `en`) and `--lang` (default `bn`). Built in: `en bn hi ur ar ta ne ru zh ja es fr de pt id`. Any other language works by name, e.g. `--lang Swahili`.
-- **Backend**: prefer one the user already pays for, so the extra cost is $0. Check with `command -v claude codex gemini opencode agy`. Otherwise use an API whose key is set: `GEMINI_API_KEY` → `gemini-api` with the provider's cheapest "lite"/"flash" model, `OPENAI_API_KEY` → `openai-api`, `ANTHROPIC_API_KEY` → `anthropic-api`.
+- **Backend**: prefer one the user already pays for, so the extra cost is $0. Check with `command -v claude agent codex gemini opencode agy` (`agent` is the Cursor CLI). Otherwise use an API whose key is set: `GEMINI_API_KEY` → `gemini-api` with the provider's cheapest "lite"/"flash" model, `OPENAI_API_KEY` → `openai-api`, `ANTHROPIC_API_KEY` → `anthropic-api`. A failed check is sent again as just the failing paragraphs, on every backend.
 
 ## 2. Prepare and pilot
 

@@ -229,6 +229,115 @@ sys.path.insert(0, str(ROOT / "tests"))
 import mock_openai
 
 
+class Repair(unittest.TestCase):
+    def test_line_up_and_blame(self):
+        sent = [(0, 0, "One"), (1, 1, "Two")]
+        self.assertEqual(ts.line_up(sent, "প্রসঙ্গ\n\n[[0]] এক\n\n[[1]] দুই"), {0: "এক", 1: "দুই"})
+        self.assertEqual(ts.line_up(sent, "প্রসঙ্গ\n\nএক\n\nদুই", context=True), {0: "এক", 1: "দুই"})
+        self.assertEqual(ts.line_up(sent, "প্রসঙ্গ\n\nএক\n\nদুই"), {})  # no context was sent: don't drop real text
+        self.assertEqual(ts.line_up(sent, "এক\n\nদুই"), {0: "এক", 1: "দুই"})  # a CLI that ignores [[tags]]
+        parts = [
+            (None, "Alice ran down the hill in the morning."),
+            (None, "The rabbit looked at his pocket watch again."),
+        ]
+        got = {0: "সকালে পাহাড়ে দৌড়াল সকালে পাহাড়ে", 1: "খরগোশ আবার ঘড়ি দেখল খরগোশ"}
+        bad = ts.blame(
+            parts,
+            [0, 1],
+            got,
+            ["glossary not followed: Alice -> এলিস"],
+            {"Alice": "এলিস", "rabbit": "খরগোশ"},
+            "en",
+            "bn",
+        )
+        self.assertEqual(bad, {0})
+
+    def _project(self, root, chunks):
+        p = Path(root)
+        (p / "chunks").mkdir()
+        (p / "out").mkdir()
+        for name, text in chunks.items():
+            (p / "chunks" / name).write_text(text, encoding="utf-8")
+        (p / "manifest.json").write_text('{"lang": "bn", "from": "en"}', encoding="utf-8")
+        return p
+
+    def _run(self, project, fake):
+        import argparse
+
+        ns = argparse.Namespace(
+            project=str(project), agents="claude", model=None, jobs=1, retries=2, fallback=False, notify=None
+        )
+        with unittest.mock.patch.object(ts, "call_agent", fake):
+            ts.Runner(ns).go()
+
+    def test_untagged_reply_is_one_call(self):
+        paras = [
+            "Alice ran down the hill in the morning.",
+            "The rabbit looked at his pocket watch again.",
+            "Everyone sat by the river until sunset.",
+        ]
+        with tempfile.TemporaryDirectory() as d:
+            p = self._project(d, {"0001.md": "\n\n".join(paras) + "\n"})
+            seen = []
+
+            def fake(name, model, system, user, timeout=1200):
+                seen.append(user)
+                body = user.split("<passage>\n", 1)[1].rsplit("\n</passage>", 1)[0]
+                return "\n\n".join("অনুবাদ " * len(ts.MARKERS.sub("", part).split()) for part in body.split("\n\n"))
+
+            self._run(p, fake)
+            self.assertEqual(len(seen), 1)
+            out = (p / "out" / "0001.md").read_text(encoding="utf-8")
+            self.assertNotIn("[[", out)
+            self.assertNotIn("Alice", out)
+
+    def test_retry_sends_only_the_failed_paragraph(self):
+        kept = [
+            "Alice ran down the hill in the morning.",
+            "The rabbit looked at his pocket watch again.",
+        ]
+        missed = "Everyone sat by the river until the sun had set."
+        with tempfile.TemporaryDirectory() as d:
+            p = self._project(
+                d,
+                {
+                    "0001.md": "Earlier context paragraph one.\n\nEarlier context paragraph two.\n",
+                    "0002.md": "\n\n".join([*kept, missed]) + "\n",
+                },
+            )
+            (p / "out" / "0001.md").write_text("আগের অনুচ্ছেদ এক।\n\nআগের অনুচ্ছেদ দুই।\n", encoding="utf-8")
+            seen = []
+
+            def fake(name, model, system, user, timeout=1200):
+                seen.append(user)
+                if len(seen) == 1:
+                    return "[[0]] অ্যালিস সকালে পাহাড় বেয়ে দৌড়াল।\n\n[[1]] খরগোশ আবার তার পকেট ঘড়ি দেখল।"
+                mem = (p / "memory.jsonl").read_text(encoding="utf-8")
+                self.assertIn(kept[0], mem)  # saved before this call, so a quota hit would not resend it
+                self.assertNotIn("<context>", user)
+                self.assertNotIn(kept[0], user)
+                return "[[2]] সবাই সূর্যাস্ত পর্যন্ত নদীর ধারে বসে রইল।"
+
+            self._run(p, fake)
+            self.assertEqual(len(seen), 2)
+            self.assertIn("<context>", seen[0])
+            self.assertIn(missed, seen[1])
+            out = (p / "out" / "0002.md").read_text(encoding="utf-8")
+            self.assertNotIn("[[", out)
+            self.assertNotIn("Everyone", out)
+            self.assertIn(missed, (p / "memory.jsonl").read_text(encoding="utf-8"))
+
+    def test_cursor_asks_instead_of_using_tools(self):
+        cmd, stdin = ts.AGENTS["cursor"](None, "SYS", "USER")
+        self.assertEqual(cmd[cmd.index("--mode") + 1], "ask")
+        self.assertEqual(cmd[cmd.index("--workspace") + 1], str(ts.SANDBOX))
+        self.assertNotIn("--force", cmd)
+        self.assertIsNone(stdin)
+        self.assertIn("Do not use tools", cmd[-1])
+        self.assertIn("SYS", cmd[-1])
+        self.assertIn("USER", cmd[-1])
+
+
 class Thinking(unittest.TestCase):
     def test_gemini_thinking_config(self):
         self.assertEqual(ts.gemini_thinking("gemini-2.5-flash"), {"thinkingBudget": 0})

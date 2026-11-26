@@ -5,7 +5,8 @@ All notable changes are listed here. The format follows [Keep a Changelog](https
 ## [Unreleased]
 
 ### Added
-- **Translation memory** (`memory.jsonl`): accepted paragraphs are reused, so re-running `prep` with other settings doesn't pay for finished work again. Partly known chunks send only their missing paragraphs.
+- **Translation memory** (`memory.jsonl`): accepted paragraphs are reused, so re-running `prep` with other settings doesn't pay for finished work again. Partly known chunks send only their missing paragraphs. A failed check retries only the paragraphs that failed, and the ones that passed are saved immediately.
+- `cursor` backend: the Cursor CLI in ask mode, pointed at an empty folder so it does not search the project or call tools. On Windows it starts through the Node entrypoint, so cmd.exe does not cut the chunk off.
 - `tomeshift redo -p PROJECT N...` forgets chunk translations, memory included. The UI's redo button uses it.
 
 ### Changed

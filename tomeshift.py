@@ -5,8 +5,8 @@
 # ///
 """tomeshift: translate whole books between any languages with an LLM, as cheaply as possible.
 
-Backends: coding-agent CLIs you already pay for (claude, agy, opencode, codex, gemini, any stdin command)
-or direct APIs (gemini-api, openai-api for any OpenAI-compatible server, anthropic-api).
+Backends: coding-agent CLIs you already pay for (claude, cursor, agy, opencode, codex, gemini, any stdin
+command) or direct APIs (gemini-api, openai-api for any OpenAI-compatible server, anthropic-api).
 
   tomeshift.py prep BOOK.pdf|.epub|.txt|.md -p PROJECT [--from en] [--lang bn]   split + clean
   tomeshift.py glossary -p PROJECT                         one agent call -> glossary.json (edit it!)
@@ -89,6 +89,21 @@ def rules_for(code, proj=None, source="en"):
 SANDBOX = Path(tempfile.gettempdir()) / "tomeshift-empty-cwd"
 SANDBOX.mkdir(exist_ok=True)
 
+
+def cursor_argv():
+    """How to start the Cursor CLI. On Windows `agent` is a .cmd shim, and cmd.exe cuts a command
+    line at 8191 characters, which is shorter than a book chunk. The Node entrypoint takes the
+    prompt directly, so the chunk survives."""
+    local = os.environ.get("LOCALAPPDATA")
+    if local:
+        root = Path(local) / "cursor-agent" / "versions"
+        found = [p for p in root.glob("*/index.js") if (p.parent / "node.exe").exists()]
+        if found:
+            latest = max(found, key=lambda p: p.stat().st_mtime)
+            return [str(latest.parent / "node.exe"), str(latest)]
+    return ["agent"]
+
+
 # ---------------------------------------------------------------- agents
 AGENTS = {
     # --system-prompt replaces Claude Code's large default prompt; no tools, no MCP, no skills.
@@ -136,6 +151,23 @@ AGENTS = {
         system + "\n\n" + user,
     ),
     "gemini": lambda model, system, user: (["gemini"] + (["-m", model] if model else []) + ["-p", system], user),
+    # Ask mode, empty workspace: a translation must not search the repo or call tools. That is the quota.
+    "cursor": lambda model, system, user: (
+        cursor_argv()
+        + [
+            "-p",
+            "--output-format",
+            "text",
+            "--mode",
+            "ask",
+            "--trust",
+            "--workspace",
+            str(SANDBOX),
+        ]
+        + (["--model", model] if model else [])
+        + ["--", "Do not use tools. Do not read or write files. Do not explain.\n\n" + system + "\n\n" + user],
+        None,
+    ),
     # Anything else: TOMESHIFT_CMD="llm -m gpt-4o-mini" gets the full prompt on stdin, prints the translation.
     "cmd": lambda model, system, user: (os.environ["TOMESHIFT_CMD"].split(), system + "\n\n" + user),
 }
@@ -617,6 +649,98 @@ def check(src, out, gloss, src_code, tgt_code):
     return problems
 
 
+def sent_rows(parts, keys):
+    """Units to send, as (index, [[tag]], source). Plain chunks are numbered; EPUB keeps its segment id."""
+    return [(k, parts[k][0] if parts[k][0] is not None else k, parts[k][1]) for k in keys]
+
+
+def passage_text(rows):
+    return "\n\n".join(f"[[{tag}]] {src}" for _, tag, src in rows)
+
+
+def line_up(sent, out, context=False):
+    """Map unit index -> translation. [[tags]] win, in any order. A reply with none is zipped in order.
+    When this call included <context>, up to two leading paragraphs are dropped: that is the model
+    translating the context. A repair call has no context, so a count mismatch is a real miss."""
+    found = split_segments(out)
+    if found:
+        return {k: found[tag] for k, tag, _ in sent if tag in found and found[tag].strip()}
+    paras = [p.strip() for p in out.strip().split("\n\n") if p.strip()]
+    extra = len(paras) - len(sent)
+    if context and sent and 0 < extra <= 2:
+        paras = paras[extra:]
+    if len(paras) != len(sent):
+        return {}
+    return {sent[i][0]: paras[i] for i in range(len(sent))}
+
+
+def unit_problem(src, tr, src_code, tgt_code):
+    """Why this one paragraph cannot be reused, or '' when it can."""
+    if not tr.strip():
+        return "empty"
+    if "⟦" in src or "⟦" in tr:
+        import tomeshift_epub
+
+        if issue := tomeshift_epub.marker_issue(src, tr):
+            return issue
+    src_script, tgt_script = lang_info(src_code)[1] or LATIN, lang_info(tgt_code)[1] or LATIN
+    src_letters = len(src_script.findall(src))
+    if tgt_script.pattern != src_script.pattern and src_letters >= 15:
+        native, left = len(tgt_script.findall(tr)), len(src_script.findall(tr))
+        if native < max(8, src_letters // 3) and left >= native:
+            return "not in the target language"
+    if len(src) > 200 and not ({src_code, tgt_code} & DENSE):
+        ratio = len(tr) / max(1, len(src))
+        if not 0.55 < ratio < 2.2:
+            return f"length ratio {ratio:.2f}"
+    return ""
+
+
+def blame(parts, keys, got, problems, gloss, src_code, tgt_code):
+    """Which of `keys` a failed check actually complains about. Empty means the check could not be
+    pinned on these paragraphs, so the caller resends all of them."""
+    text = " | ".join(problems)
+    bad = set()
+    for k in keys:
+        src, tr = parts[k][1], got.get(k, "")
+        if not tr:
+            bad.add(k)
+            continue
+        if "marker" in text and ("⟦" in src or "⟦" in tr):
+            import tomeshift_epub
+
+            if tomeshift_epub.marker_issue(src, tr):
+                bad.add(k)
+        if "glossary" in text and any(en in src and trn not in tr for en, trn in gloss.items()):
+            bad.add(k)
+        if ("untranslated" in text or "not in the target language" in text) and unit_problem(
+            src, tr, src_code, tgt_code
+        ):
+            bad.add(k)
+        if "length ratio" in text and unit_problem(src, tr, src_code, tgt_code).startswith("length"):
+            bad.add(k)
+        if "paragraph" in text and src.count("\n\n") != tr.count("\n\n"):
+            bad.add(k)
+    return bad
+
+
+def salvage(parts, keys, got, src_code, tgt_code):
+    """A reply that came back with some [[tags]] missing. Keep the paragraphs that look intact and
+    resend the rest, plus a neighbour that looks like it swallowed the missing one."""
+    missing = [k for k in keys if k not in got]
+    bad = set(missing)
+    for k in keys:
+        if k not in got:
+            continue
+        src, tr = parts[k][1], got[k]
+        swallowed = (
+            missing and len(src) > 80 and not ({src_code, tgt_code} & DENSE) and len(tr) / max(1, len(src)) > 1.8
+        )
+        if unit_problem(src, tr, src_code, tgt_code) or swallowed:
+            bad.add(k)
+    return bad
+
+
 # ---------------------------------------------------------------- translation memory
 # memory.jsonl keeps every accepted paragraph (EPUB: segment) translation, keyed by its source text, so the
 # same text is never paid for twice: not after re-running prep with other settings, nor in a later run.
@@ -737,6 +861,40 @@ class Runner:
         prev = self.chunks[idx - 1].read_text(encoding="utf-8").strip().split("\n\n")[-2:]
         return "<context>\n" + MARKERS.sub("", "\n\n".join(prev)).strip() + "\n</context>\n\n"
 
+    def chunk_problems(self, full, parts, chosen, epub):
+        out = self.assemble(parts, chosen, {}, epub)
+        src = full if epub else "\n\n".join(u for _, u in parts) + "\n"
+        gloss = {k: v for k, v in self.gloss.items() if k in src}
+        return out, check(src, out, gloss, self.src_lang, self.lang)
+
+    def remember_ok(self, parts, good):
+        """Write clean paragraphs to memory now. A CLI can hit its quota on the next call; these stay done."""
+        learned = [(parts[k][1], tr) for k, tr in good.items() if tr and self.memory.get(parts[k][1]) != tr]
+        if learned:
+            with self.lock:
+                self.memory.update(dict(learned))
+                remember(self.proj, learned)
+
+    def accept(self, dest, full, parts, chosen, epub, stem, agent, from_memory):
+        out, problems = self.chunk_problems(full, parts, chosen, epub)
+        if problems:
+            blamed = blame(parts, list(chosen), chosen, problems, self.gloss, self.src_lang, self.lang)
+            clean = {
+                k: tr
+                for k, tr in chosen.items()
+                if k not in blamed and not unit_problem(parts[k][1], tr, self.src_lang, self.lang)
+            }
+        else:
+            clean = chosen
+        dest.write_text(out, encoding="utf-8")
+        self.remember_ok(parts, clean)
+        if from_memory:
+            self.log(stem, agent, f"{from_memory} of {len(parts)} paragraphs from translation memory")
+        if problems:
+            self.log(stem, agent, "accepted with problems: " + " | ".join(problems))
+            with (self.proj / "review.txt").open("a", encoding="utf-8") as f:
+                f.write(f"{stem}: {' | '.join(problems)}\n")
+
     def translate(self, idx):
         chunk = self.chunks[idx]
         dest = self.proj / "out" / f"{chunk.stem}.md"
@@ -750,17 +908,21 @@ class Runner:
             self.save(dest, full, self.assemble(parts, known, {}, epub), [])
             self.log(chunk.stem, "memory", "all from translation memory")
             return
-        # Send only what the memory lacks, tagged [[k]] (EPUB: its segment id) so the reply merges back in place.
-        src = "\n\n".join(f"[[{i if epub else k}]] {u}" for k, (i, u) in enumerate(parts) if k not in known)
-        src = src + "\n" if known else full
-        terms = {k: v for k, v in self.gloss.items() if k in src}  # only terms this chunk uses
-        system = self.rules + (
-            "\n\nGlossary (use exactly):\n" + "\n".join(f"{k} = {v}" for k, v in terms.items()) if terms else ""
-        )
-        feedback, backoff = "", 600
+        pending = [k for k in range(len(parts)) if k not in known]
+        reused, feedback, backoff = len(known), "", 600
         for attempt in range(self.a.retries + 1):
+            # Tags let a partial reply be saved. Context goes out only with a whole chunk: a repair is a
+            # few paragraphs, and the previous chunk's context makes a CLI translate it and spend another call.
+            rows = sent_rows(parts, pending)
+            src = passage_text(rows)
+            terms = {k: v for k, v in self.gloss.items() if k in src}
+            system = self.rules + (
+                "\n\nGlossary (use exactly):\n" + "\n".join(f"{k} = {v}" for k, v in terms.items()) if terms else ""
+            )
+            whole = pending == list(range(len(parts)))
+            context = self.context_for(idx) if whole and not feedback else ""
             agent = self.pick_agent()
-            user = self.context_for(idx) + feedback + "<passage>\n" + src.strip() + "\n</passage>"
+            user = context + feedback + "<passage>\n" + src + "\n</passage>"
             try:
                 out = tidy(call_agent(agent, self.a.model if agent == self.agents[0] else None, system, user))
             except LimitHit as e:
@@ -771,24 +933,31 @@ class Runner:
                     if not self.paused[agent]:
                         self.notify(f"{agent} hit its limit; paused until {until.astimezone():%H:%M}")
                     self.paused[agent] = until
-                return self.translate(idx)  # limit doesn't use up a retry
+                return self.translate(idx)  # limit doesn't use up a retry; memory already holds the good paragraphs
             except RuntimeError as e:
                 feedback = ""
                 self.log(chunk.stem, agent, f"error: {e}")
                 time.sleep(10)
                 continue
-            problems = check(src, out, terms, self.src_lang, self.lang)
-            if not problems or attempt == self.a.retries:
-                if known:
-                    self.log(chunk.stem, agent, f"{len(known)} of {len(parts)} paragraphs from translation memory")
-                    out = self.assemble(parts, known, split_segments(out), epub)
-                self.save(dest, full, out, problems)
-                if problems:
-                    self.log(chunk.stem, agent, "accepted with problems: " + " | ".join(problems))
-                    with (self.proj / "review.txt").open("a", encoding="utf-8") as f:
-                        f.write(f"{chunk.stem}: {' | '.join(problems)}\n")
+            got = line_up(rows, out, bool(context))
+            if len(got) == len(rows):
+                _, problems = self.chunk_problems(full, parts, {**known, **got}, epub)
+                bad = blame(parts, pending, got, problems, self.gloss, self.src_lang, self.lang) or set(pending)
+                if not problems:
+                    bad = set()
+            else:
+                bad = salvage(parts, pending, got, self.src_lang, self.lang)
+                problems = [f"{len(bad)} of {len(rows)} paragraphs did not line up"]
+            if not bad or attempt == self.a.retries:
+                self.accept(dest, full, parts, {**known, **got}, epub, chunk.stem, agent, reused)
                 return
+            good = {k: got[k] for k in pending if k not in bad and k in got}
+            if good and set(bad) != set(pending):
+                self.remember_ok(parts, good)
+                known.update(good)
+                self.log(chunk.stem, agent, f"kept {len(good)} paragraphs, retrying {len(bad)}")
             self.log(chunk.stem, agent, "retry: " + " | ".join(problems))
+            pending = [k for k in pending if k in bad]
             feedback = "Your previous attempt had these problems, fix them: " + "; ".join(problems) + "\n\n"
 
     @staticmethod

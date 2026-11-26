@@ -249,7 +249,14 @@ ICON = (
     '<path d="M150 112C210 52 302 52 362 112" fill="none" stroke="#F2A33A" stroke-width="26" stroke-linecap="round"/></svg>'
 )
 API_BACKENDS = {"gemini-api", "openai-api", "anthropic-api", "cmd"}
-CMD_OF = {"claude": "claude", "agy": "agy", "opencode": "opencode", "codex": "codex", "gemini": "gemini"}
+CMD_OF = {
+    "claude": "claude",
+    "cursor": "agent",
+    "agy": "agy",
+    "opencode": "opencode",
+    "codex": "codex",
+    "gemini": "gemini",
+}
 
 
 def serve(root, host, port, langs, backends, open_browser=True):
